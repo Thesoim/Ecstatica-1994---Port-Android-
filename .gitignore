@@ -1,0 +1,115 @@
+logs.txt
+data/e1/**
+data/e1-dos/**
+data/e2/**
+
+decomp/ida/ECSTATIC.EXE
+decomp/ida/E2WIN95.EXE
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+
+*.ppm
+
+# Logs
+logs
+*.log
+
+# Diagnostic reports (https://nodejs.org/api/report.html)
+report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
+
+# Runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Compiled binary addons (https://nodejs.org/api/addons.html)
+build/Release
+
+# Output of 'npm pack'
+*.tgz
+
+# dotenv environment variables file
+.env
+.env.test
+
+# parcel-bundler cache (https://parceljs.org/)
+.cache
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+eggs/
+.eggs/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+#  Usually these files are written by a python script from a template
+#  before PyInstaller builds the exe, so as to inject date/other infos into it.
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+.DS_Store
+
+# DOS build output (platforms/dos/Makefile is wmake, not GNU make)
+platforms/dos/*.obj
+platforms/dos/*.exe
+platforms/dos/*.map
+platforms/dos/link.lnk
+
+# Win9x build output (platforms/win9x/Makefile is wmake, not GNU make)
+platforms/win9x/*.obj
+platforms/win9x/*.exe
+platforms/win9x/*.map
+platforms/win9x/link.lnk
+# Watcom writes <name>.err beside any source that produces a diagnostic
+*.err
+
+# PSP build output
+platforms/psp/obj/
+platforms/psp/build/
+platforms/psp/*.elf
+platforms/psp/*.PBP
+platforms/psp/PARAM.SFO
+platforms/vita/build/
+
+# Release packaging output
+dist/
+ecstatica-dos.zip
+ecstatica-win9x.zip

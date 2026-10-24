@@ -1,0 +1,6 @@
+*.iso
+build/
+
+# Proprietary sample data — never commit a MIDI bank.
+core/bank.ofsf
+*.ofsf

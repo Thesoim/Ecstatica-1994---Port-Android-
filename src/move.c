@@ -1,0 +1,4046 @@
+/**
+ * move.c
+ *
+ * Movement system: actor movement processing, walking, collision,
+ * height finding, animation playback, behavioral state machine.
+ */
+
+#include "move.h"
+#include "asm_f.h"
+#include "display.h"
+#include "edit.h"
+#include "ellipse.h"
+#include "file.h"
+#include "game.h"
+#include "init.h"
+#include "map.h"
+#include "menu.h"
+#include "music.h"
+#include "req.h"
+#include "topo.h"
+#include <string.h>
+#include <stdlib.h>
+#include "compat.h"
+#include "prof.h"
+#ifndef _WIN32
+#endif
+
+/* Walk/action diagnostics. Inert unless ECSTATICA_TRACE_WALK is set;
+ * ECSTATICA_TRACE_WALK_ACTOR=<name_index> adds per-frame lines for one NPC. */
+static int walk_trace_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("ECSTATICA_TRACE_WALK");
+        on = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return on;
+}
+static int walk_trace_actor(void) {
+    static int idx = -2;
+    if (idx == -2) {
+        const char *e = getenv("ECSTATICA_TRACE_WALK_ACTOR");
+        idx = (e && *e) ? atoi(e) : -1;
+    }
+    return idx;
+}
+static FILE *walk_trace_fp(void) {
+    static FILE *fp = NULL;
+    if (!fp) {
+        const char *p = getenv("ECSTATICA_TRACE_WALK_OUT");
+        fp = fopen(p && *p ? p : "walk_trace.log", "w");
+    }
+    return fp;
+}
+#define WTRACE(...) do { \
+    if (walk_trace_on()) { FILE *f_ = walk_trace_fp(); if (f_) { fprintf(f_, __VA_ARGS__); fflush(f_); } } \
+} while (0)
+
+/* Pick-up diagnostics. Inert unless ECSTATICA_TRACE_PICKUP is set. */
+static int pickup_trace_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("ECSTATICA_TRACE_PICKUP");
+        on = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return on;
+}
+#define PTRACE(...) do { \
+    if (pickup_trace_on()) { fprintf(stderr, __VA_ARGS__); fflush(stderr); } \
+} while (0)
+
+static int action_has_hit_event(action_t *action) {
+    if (!action) return 0;
+    for (key_state_t *k = action->key_list; k; k = k->next)
+        for (event_t *e = k->key_event_list; e; e = e->next)
+            if (e->event_type == INTERACT && e->param1 == 0)
+                return 1;
+    return 0;
+}
+
+static void walk_trace_dump_rep(actor_t *actor) {
+    static unsigned char done[REPERTOIRE_TAB_SIZE];
+    if (!walk_trace_on() || !actor || !actor->actor_reperture) return;
+    rephead_t *rep = actor->actor_reperture;
+    int ri = rep->rep_index;
+    if (ri < 0 || ri >= REPERTOIRE_TAB_SIZE || done[ri]) return;
+    done[ri] = 1;
+    WTRACE("REPDUMP actor=%d rep=%d thing=%d flags=%04x\n",
+           actor->name_index, ri, rep->thing_index, rep->rep_flags);
+    for (int i = 0; i < 60; i++) {
+        int16_t ai = rep->action_slots[i];
+        if (ai < 0) continue;
+        check_action_loaded(ai);
+        action_t *a = (ai < ACTION_TAB_SIZE) ? action_tab[ai] : NULL;
+        WTRACE("  slot %3d -> act %4d %s hit=%d dur=%d flags=%04x\n",
+               i, ai, a ? "loaded" : "MISSING",
+               action_has_hit_event(a), a ? a->act_duration : -1,
+               a ? a->action_flags : 0);
+    }
+}
+
+static void walk_trace_dump_action(action_t *action) {
+    static unsigned char done[ACTION_TAB_SIZE];
+    if (!walk_trace_on() || !action) return;
+    int idx = action->action_index;
+    if (idx < 0 || idx >= ACTION_TAB_SIZE || done[idx]) return;
+    done[idx] = 1;
+    WTRACE("ACTDUMP act=%d dur=%d flags=%04x next=%d thing=%d\n",
+           idx, action->act_duration, action->action_flags,
+           action->next_action_index, action->thing_name_index);
+    for (key_state_t *k = action->key_list; k; k = k->next) {
+        WTRACE("  key pos=%u f=%d\n", k->KEY_position, k->field_E);
+        for (event_t *e = k->key_event_list; e; e = e->next)
+            WTRACE("    ev type=%d idx=%d p1=%d p2=%d p3=%d\n",
+                   e->event_type, e->event_index, e->param1, e->param2, e->param3);
+    }
+}
+
+/* move_do_movement_427998 — called every frame from game loop */
+void do_movement(void) {
+    int some_time = x_time;
+    break_do_movement = 0;
+    num_info_lines = 0;
+
+    PROF_FRAME();
+
+    PROF_BEGIN(PROF_WAIT);
+    x_time = wait_for_tick_after(some_time);
+    PROF_END(PROF_WAIT);
+    PROF_BEGIN(PROF_LOGIC);
+
+    int local_game_time = x_time - some_time;
+    if (slow_motion) {
+        local_game_time /= 3;
+        if (!local_game_time)
+            local_game_time = 1;
+    }
+    if (stop_the_clock) {
+        local_game_time = 0;
+        stop_the_clock = false;
+    }
+
+    int16_t save_game_timer = (int16_t)game_timer;
+    game_time += 3 * local_game_time;
+
+    if (game_timer > 0) {
+        show_timer(game_timer, game_timer == local_game_time, game_timer - local_game_time);
+        game_timer -= local_game_time;
+        if (save_game_timer == local_game_time)
+            game_timer = -1;
+    }
+
+    interval = local_game_time;
+
+    check_encounter();
+
+    /* Demo: auto-press space while intro is active. CT_END_OF_INTRO clears
+     * intro_flag from inside the scene scripts; once cleared, player regains
+     * control. */
+    if (demo_option && intro_flag) {
+        space_pressed = true;
+    }
+
+    actor_t *actor = root_thing;
+    if (root_thing) {
+        while (1) {
+            action_t *action = actor->actor_act.act_action;
+
+            if (action && (action->action_flags & 2)) {
+                set_vector(&actor->actor_velocity, 0, 0, 0);
+
+                if (actor->actor_act.flags & 0x400) {
+                    actor->actor_act.act_action = NULL;
+                    actor->flags |= 0x40;
+                    if (!moving_camera)
+                        actor->flags |= 0x400;
+                    scene_t *actor_scene = actor->actor_scene;
+                    actor->actor_scene = NULL;
+
+                    /* Only walk scripts if actor was bound to a scene. */
+                    if (actor_scene) {
+                        bool all_done = true;
+                        int blocker_ai = -1;
+                        for (script_t *script = actor_scene->scene_script_list;
+                             script; script = script->next_script) {
+                            if (script->script_action.action_flags & 0x20) {
+                                continue;
+                            }
+                            int script_actor_idx = script->script_actor_index;
+                            actor_t *script_actor = (script_actor_idx >= 0 && script_actor_idx < THING_TAB_SIZE) ? thing_tab[script_actor_idx] : NULL;
+                            if (!script_actor) {
+                            } else if (script_actor->actor_act.act_action != &script->script_action) {
+                            } else if (!(thing_name_flags[script_actor_idx] & 2)) {
+                            } else {
+                                all_done = false;
+                                if (blocker_ai < 0) blocker_ai = script_actor_idx;
+                            }
+                        }
+                        if (all_done) {
+                            scene_name_flags[actor_scene->scene_index] |= 4;
+                            int16_t code_idx = actor_scene->scene_code_2;
+                            if (code_idx >= 0) {
+                                code_t *code = code_tab[code_idx];
+                                if (code)
+                                    execute_code(code, NULL);
+                                else
+                                    DBG_LOG(1, "[SCENE] P1 code2=%d is NULL!\n", code_idx);
+                            } else {
+                            }
+                        } else {
+                        }
+                    }
+                } else {
+                    for (act_t *act = actor->actor_act_list; act; act = act->next)
+                        update_act(act, actor, local_game_time);
+
+                    update_act(&actor->actor_act, actor, local_game_time);
+                    free_spent_acts(actor);
+                }
+            } else {
+                actor->flags &= 0xFF7F;
+                if (actor->actor_behavior != BH_EXTERNAL)
+                    behaviour(actor, local_game_time);
+            }
+
+            if (break_do_movement)
+                return;
+
+            actor = actor->next_in_display_list;
+            if (!actor)
+                break;
+        }
+    }
+
+    scene_t *current_scene = NULL;
+    if (root_scene) {
+        for (scene_t *scene = root_scene; scene; scene = scene->next_scene) {
+            bool all_done = true;
+            for (script_t *script = scene->scene_script_list;
+                 script; script = script->next_script) {
+                if (!(script->script_action.action_flags & 0x20)) {
+                    int script_actor_idx = script->script_actor_index;
+                    actor_t *script_actor = thing_tab[script_actor_idx];
+                    if (script_actor &&
+                        &script->script_action == script_actor->actor_act.act_action) {
+                        if (thing_name_flags[script_actor_idx] & 2)
+                            all_done = false;
+                    }
+                }
+            }
+
+            if (all_done) {
+                /* Phase 1 sets bit 4 when it fires scene_code_2; don't fire it twice. */
+                bool already_finished = (scene_name_flags[scene->scene_index] & 4) != 0;
+                scene_name_flags[scene->scene_index] |= 4;
+                if (!current_scene)
+                    root_scene = scene->next_scene;
+                else
+                    current_scene->next_scene = scene->next_scene;
+                scene->scene_use_flag &= 0xFFFE;
+                /* E1 fallback for scenes with no scene_code_index (intro scene
+                 * 139), which rely on this to reach CT_END_OF_INTRO. Scenes with
+                 * a running code_index chain on their own; firing scene_code_2
+                 * for them restarts scene 498 on skip. */
+                if (game_version == GAME_VERSION_E1 && !already_finished
+                    && scene->scene_code_index < 0
+                    && scene->scene_code_2 >= 0) {
+                    code_t *c2 = code_tab[scene->scene_code_2];
+                    if (c2) execute_code(c2, NULL);
+                }
+            } else {
+                scene->scene_time = game_time;
+                int16_t code_idx = scene->scene_code_index;
+                if (code_idx >= 0) {
+                    code_t *code = code_tab[code_idx];
+                    if (code)
+                        execute_code(code, NULL);
+                }
+                current_scene = scene;
+            }
+        }
+    }
+
+    if (need_clear_graphics) clear_graphics();
+    PROF_END(PROF_LOGIC);
+    PROF_BEGIN(PROF_PREPARE);
+    prepare_parts();
+    PROF_END(PROF_PREPARE);
+    PROF_BEGIN(PROF_STUCK);
+    draw_stuck_parts();
+    PROF_END(PROF_STUCK);
+    PROF_BEGIN(PROF_DRAW);
+    draw_parts();
+    if (need_draw_graphics) draw_graphics();
+    PROF_END(PROF_DRAW);
+    PROF_BEGIN(PROF_SHOW);
+    show_parts();
+    PROF_END(PROF_SHOW);
+
+    if (selected_thing &&
+        selected_thing->actor_behavior == BH_DEAD &&
+        selected_thing->action_delay <= 0) {
+        if (game_version == 1) {
+            int scene_id;
+            switch (selected_camera) {
+            case 5: case 6: case 42:
+                scene_id = female ? 4 : 2;
+                break;
+            case 44: case 85: case 103: case 111:
+                scene_id = female ? 3 : 1;
+                break;
+            default:
+                scene_id = (rand() % 2) ? (female ? 3 : 1)
+                                        : (female ? 4 : 2);
+                break;
+            }
+            play_dead_scene(scene_id);
+        } else {
+            key_esc_was_forced = 1;
+        }
+    } else if (!selected_thing && game_version == 2) {
+        key_esc_was_forced = 1;
+    }
+    if (game_timer < 0) {
+        game_timer = 0;
+        int16_t scene_idx = find_scene_name_index("olddie2");
+        if (scene_idx < 0)
+            do_info_req("Can't find scene: 'olddie2'");
+        else
+            play_dead_scene(scene_idx);
+    }
+}
+
+/* Hit direction mapping table (from ASM dword_427140) */
+static const int16_t hit_dir_table[8] = { 5, 8, 7, 6, 3, 0, 1, 2 };
+
+/* move_do_wander  E1: 0x4237E4 | E2: 0x42A00C */
+int16_t do_wander(actor_t *actor) {
+    int dir_x = (actor->actor_box_size * sine_table[(uint16_t)actor->rotate_vector.Y]) >> 14;
+    int dir_z = (actor->actor_box_size * cosn_table[(uint16_t)actor->rotate_vector.Y]) >> 14;
+
+    vector_t probe_right, probe_fwd, probe_left;
+    probe_right.Y = probe_left.Y = probe_fwd.Y = actor->position_vector.Y;
+
+    if (actor->wander_direction) {
+        probe_fwd.X = 2 * dir_x + actor->position_vector.X;
+        probe_fwd.Z = 2 * dir_z + actor->position_vector.Z;
+        probe_left.X = 2 * dir_x - (dir_z + (dir_z >> 2)) + actor->position_vector.X;
+        probe_left.Z = ((dir_x >> 2) + dir_x) + 2 * dir_z + actor->position_vector.Z;
+        probe_right.X = 2 * dir_x + (dir_z + (dir_z >> 2)) + actor->position_vector.X;
+        probe_right.Z = 2 * dir_z - (dir_x + (dir_x >> 2)) + actor->position_vector.Z;
+    } else {
+        probe_fwd.X = 2 * dir_x + actor->position_vector.X;
+        probe_fwd.Z = 2 * dir_z + actor->position_vector.Z;
+        probe_left.X = 2 * dir_x - dir_z + actor->position_vector.X;
+        probe_left.Z = dir_x + 2 * dir_z + actor->position_vector.Z;
+        probe_right.X = 2 * dir_x + dir_z + actor->position_vector.X;
+        probe_right.Z = -dir_x + 2 * dir_z + actor->position_vector.Z;
+    }
+
+    int16_t block_flags = 0;
+    int height_diff = abs(find_height_now(&probe_fwd, actor) - actor->position_vector.Y);
+    if (height_diff > 256) block_flags |= 1;
+
+    height_diff = abs(find_height_now(&probe_left, actor) - actor->position_vector.Y);
+    if (height_diff > 256) block_flags |= 2;
+
+    height_diff = abs(find_height_now(&probe_right, actor) - actor->position_vector.Y);
+    if (height_diff > 256) block_flags |= 4;
+
+    int16_t result;
+    if (actor->wander_direction) {
+        switch (block_flags) {
+        case 0:
+            result = 1;
+            actor->wander_direction = 0;
+            break;
+        default: /* 1-7 */
+            result = (actor->wander_direction < 0) ? 3 : 5;
+            break;
+        }
+    } else {
+        switch (block_flags) {
+        case 0: case 6:
+            result = 1;
+            break;
+        case 1: case 7:
+            actor->wander_direction = 2 * my_rand();
+            result = 1000;
+            break;
+        case 2: case 3:
+            actor->wander_direction = 1;
+            result = 5;
+            break;
+        case 4: case 5:
+            actor->wander_direction = -1;
+            result = 3;
+            break;
+        default:
+            result = 1;
+            break;
+        }
+    }
+    return result;
+}
+
+/* move_do_new_wander  E1: 0x423B3C | E2: 0x42A364 */
+int16_t do_new_wander(actor_t *actor) {
+    int dir_z = (actor->actor_box_size * cosn_table[(uint16_t)actor->rotate_vector.Y]) >> 15;
+    int dir_x = (actor->actor_box_size * sine_table[(uint16_t)actor->rotate_vector.Y]) >> 15;
+
+    vector_t vv21, vv22, v22_probe;
+    vv22.Y = vv21.Y = actor->position_vector.Y;
+    v22_probe.Y = actor->position_vector.Y;
+
+    if (actor->wander_direction) {
+        vv21.X = 2 * dir_x + actor->position_vector.X;
+        vv21.Z = 2 * dir_z + actor->position_vector.Z;
+        vv22.X = 2 * dir_x + actor->position_vector.X - dir_z - (dir_z >> 2);
+        vv22.Z = dir_x + 2 * dir_z + actor->position_vector.Z + (dir_x >> 2);
+        v22_probe.X = 2 * dir_x + actor->position_vector.X + dir_z + (dir_z >> 2);
+        v22_probe.Z = 2 * dir_z + actor->position_vector.Z - dir_x - (dir_x >> 2);
+    } else {
+        vv21.X = 2 * dir_x + actor->position_vector.X;
+        vv21.Z = 2 * dir_z + actor->position_vector.Z;
+        vv22.X = 2 * dir_x + actor->position_vector.X - dir_z;
+        vv22.Z = dir_x + 2 * dir_z + actor->position_vector.Z;
+        v22_probe.X = dir_z + actor->position_vector.X + 2 * dir_x;
+        v22_probe.Z = 2 * dir_z + actor->position_vector.Z - dir_x;
+    }
+
+    int16_t block_flags = 0;
+    int height_diff = abs(find_height_now(&vv21, actor) - actor->position_vector.Y);
+    if (height_diff > 256) block_flags |= 1;
+
+    height_diff = abs(find_height_now(&vv22, actor) - actor->position_vector.Y);
+    if (height_diff > 256) block_flags |= 2;
+
+    height_diff = abs(find_height_now(&v22_probe, actor) - actor->position_vector.Y);
+    if (height_diff > 256) block_flags |= 4;
+
+    int16_t result;
+    if (actor->wander_direction) {
+        switch (block_flags) {
+        case 0:
+            result = 1;
+            actor->wander_direction = 0;
+            break;
+        case 1: case 2: case 3: case 4: case 5: case 6: case 7:
+            result = (actor->wander_direction <= 0) ? 3 : 5;
+            break;
+        default:
+            result = 1;
+            break;
+        }
+    } else {
+        switch (block_flags) {
+        case 0: case 6:  result = 1; break;
+        case 1: case 7:  actor->wander_direction = 2 * my_rand(); result = 1000; break;
+        case 2: case 3:  actor->wander_direction = 1; result = 5; break;
+        case 4: case 5:  actor->wander_direction = -1; result = 3; break;
+        default:         result = 1; break;
+        }
+    }
+    return result;
+}
+
+/* move_behaviour  E1: ? | E2: 0x427554 */
+void behaviour(actor_t *actor, int game_time_arg) {
+    if (!actor) return;
+
+    int one_shot_action = 0;
+
+    actor->state_flags &= 0xFFFD;
+    if (actor == selected_thing) {
+        actor->rotate_vector.Z = 0;
+        actor->rotate_vector.X = 0;
+    }
+
+    if (actor->actor_rep_index < 0) {
+        if (actor->actor_rep_index == -2)
+            do_info2_req("Actor has -2 RepName",
+                         thing_names[actor->name_index].field_0);
+        rephead_t *rep = actor->actor_reperture;
+        if (rep)
+            rep->rep_use_flag &= 0xFFFD;
+        actor->actor_reperture = NULL;
+    } else {
+        rephead_t *rep = actor->actor_reperture;
+        if (rep) {
+            if (rep->rep_index != actor->actor_rep_index) {
+                rep->rep_use_flag &= 0xFFFD;
+                check_rep_loaded(actor->actor_rep_index);
+                actor->actor_reperture = repertoire_tab[actor->actor_rep_index];
+                if (actor->move_type == 1000)
+                    actor->flags |= 0x40;
+            }
+        } else {
+            check_rep_loaded(actor->actor_rep_index);
+            actor->actor_reperture = repertoire_tab[actor->actor_rep_index];
+        }
+        if (actor->actor_reperture)
+            actor->actor_reperture->rep_time = game_time;
+    }
+
+    action_t *action = actor->force_action_to_execute;
+    int action_type = 1;
+    if (!action) {
+        action_type = 2;
+        action = actor->queued_action;
+    }
+    if (!action) {
+        taction_t *taction = actor->tactions_list;
+        if (taction && game_time - taction->taction_time > 0) {
+            action_type = 3;
+            check_action_loaded(taction->taction_index);
+            action = action_tab[taction->taction_index];
+        }
+    }
+
+    if (actor->actor_behavior == BH_DYING || actor->actor_behavior == BH_DEAD
+        || actor->actor_hitpoints < 0)
+        action = NULL;
+    if (action && actor->actor_act.act_action
+        && (actor->actor_act.flags & 0x40) && !(actor->flags & 0x40))
+        action = NULL;
+
+    if (action) {
+        actor->actor_act.act_action = action;
+        actor->actor_act.duration = action->act_duration;
+        if (game_version != GAME_VERSION_E1 && actor->actor_Speed_factor != 100)
+            actor->actor_act.duration = 100 * actor->actor_act.duration / actor->actor_Speed_factor;
+        actor->actor_act.key_progress = 0;
+        actor->actor_act.actor_keys_list = action->key_list;
+        /* asm anim_behaviour_428914+107: E1 ors in 0x40 only, no 0x80. */
+        actor->actor_act.flags = (action->action_flags & 0xFE)
+            | (game_version == GAME_VERSION_E1 ? 0x40 : 0xC0);
+        update_thing(actor);
+        actor->move_type = -1;
+        if (game_version == GAME_VERSION_E1) {
+            if (actor->actor_behavior != BH_RECOVERING &&
+                actor->actor_behavior != BH_GET_HIT)
+                actor->flags &= ~0x2000;
+            /* asm anim_behaviour_428914+140: cleared for every action_type,
+             * not only the forced one. */
+            actor->force_action_to_execute = NULL;
+            actor->flags &= ~0x40;
+        } else {
+            actor->flags = (actor->flags | 0x2000) & ~0x40;
+        }
+        if (action_type == 1) {
+            if (actor->state_flags & 0x10)
+                actor->actor_act.flags |= 0x1000;
+            actor->force_action_to_execute = NULL;
+        } else if (action_type == 2) {
+            actor->queued_action = NULL;
+        } else if (action_type == 3) {
+            taction_t *taction = actor->tactions_list;
+            actor->tactions_list = taction->next;
+            free_taction(taction);
+        }
+    }
+
+    rephead_t *repertoire = actor->actor_reperture;
+    /* The E1 hero has default_repert 0, so this exit would fire and it would
+     * never get BH_JOYSTICK. */
+    bool hero_needs_input =
+        (actor == selected_thing) && joystick_control &&
+        actor->actor_behavior != BH_GET_HIT &&
+        actor->actor_behavior != BH_DYING &&
+        actor->actor_behavior != BH_DEAD &&
+        actor->actor_behavior != BH_RECOVERING;
+    if (!hero_needs_input &&
+        (!repertoire || !repertoire->rep_index) && !actor->actor_act.act_action) {
+        if (actor->action_delay > 0) {
+            actor->action_delay -= game_time_arg;
+            if (actor->action_delay < 0)
+                actor->action_delay = 0;
+        }
+        actor->flags |= 0x400;
+        return;
+    }
+
+    int16_t next_move = 1000;
+    actor_t *interact_actor;
+    if (actor == selected_thing) {
+        if (joystick_control) {
+            if (actor->actor_behavior != BH_GET_HIT &&
+                actor->actor_behavior != BH_DYING &&
+                actor->actor_behavior != BH_DEAD &&
+                actor->actor_behavior != BH_RECOVERING)
+                actor->actor_behavior = BH_JOYSTICK;
+            interact_actor = NULL;
+        } else if (actor->actor_behavior == BH_FOLLOW) {
+            interact_actor = (actor->interact_target_index < 0) ? NULL : thing_tab[actor->interact_target_index];
+        } else {
+            interact_actor = NULL;
+            for (actor_t *fa = root_thing; fa; fa = fa->next_in_display_list) {
+                if (fa != actor) {
+                    actor_t *holder = (actor_t *)fa->part_heap_link;
+                    if (holder) holder = holder->parent_actor;
+                    if (holder != actor) {
+                        if (fa->actor_reperture && fa->actor_reperture->action_slots[34] >= 0) {
+                            int16_t direction, distance;
+                            find_direction_and_distance(&direction, &distance,
+                                fa->position_vector.X - actor->position_vector.X,
+                                fa->position_vector.Z - actor->position_vector.Z);
+                            if (distance < 1000) {
+                                interact_actor = fa;
+                                if (distance < 700)
+                                    break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else if (selected_thing && selected_thing->actor_behavior != BH_DEAD
+               && selected_thing->actor_behavior != BH_DYING) {
+        if (game_version == GAME_VERSION_E1) {
+            interact_actor = selected_thing;
+        } else {
+            if (actor->state_flags & 8)
+                interact_actor = look_for_a_fight(actor);
+            else
+                interact_actor = selected_thing;
+        }
+    } else {
+        interact_actor = NULL;
+    }
+
+    part_t *interact_part = NULL;
+    if (interact_actor) {
+        interact_part = interact_actor->_PartTab ? interact_actor->_PartTab->field_0[2] : NULL;
+        if (!interact_part) {
+            interact_part = interact_actor->actor_parts_list;
+            if (!interact_part)
+                interact_actor = NULL;
+        }
+    }
+
+    part_t *part = actor->_PartTab ? actor->_PartTab->field_0[2] : NULL;
+    if (!part) {
+        part = actor->actor_parts_list;
+        if (!part)
+            interact_actor = NULL;
+    }
+    if (interact_actor && interact_actor->actor_parts_list
+        && (interact_actor->actor_parts_list->flags & 0x42))
+        interact_actor = NULL;
+
+    int target_direction = 0;
+    int16_t target_distance = 0x7FFF;
+    int16_t rel_angle = 0;
+            int vertical_direction = 0; (void)vertical_direction;
+    int los_blocked = 0;
+
+    if (!interact_actor || (interact_actor->flags & 0x80)) {
+        rel_angle = 0;
+        target_distance = 0x7FFF;
+    } else {
+        int16_t dx = interact_part->ellipse_center.X - part->ellipse_center.X;
+        int16_t dz = interact_part->ellipse_center.Z - part->ellipse_center.Z;
+        int16_t dy = interact_part->ellipse_center.Y - part->ellipse_center.Y;
+        target_direction = arctan(dx, dz);
+        target_distance = (int16_t)(abs(dz) < abs(dx)
+            ? abs(dz) / 2 + abs(dx)
+            : abs(dx) / 2 + abs(dz));
+
+        if (game_version == GAME_VERSION_E1) {
+            /* anim_behaviour_428914+36D..+3A1: E1 takes the facing straight from
+             * rotate_vector.Y (the part matrix would quantise it to 256-unit steps
+             * and make rel_angle chatter on the 4096 turn threshold) and has no
+             * line-of-sight raycast or interact bookkeeping — that is E2. */
+            rel_angle = actor->rotate_vector.Y - (int16_t)target_direction;
+            if (abs(dy) > 768) {
+                target_distance = 0x7FFF;
+                rel_angle = 0;
+            }
+            goto have_target;
+        }
+
+        /* behaviour_427554+8FD: rel_angle is the actor's own facing. A body
+         * part's heading, twisted by the idle pose, kept actors out of the 2048
+         * attack cone. */
+        rel_angle = actor->rotate_vector.Y - (int16_t)target_direction;
+        if (abs(dy) <= 768 || abs(dy) <= target_distance) {
+            if (target_distance / 3 >= abs(dy))
+                vertical_direction = 0;
+            else if (dy <= 0)
+                vertical_direction = -1;
+            else
+                vertical_direction = 1;
+        } else {
+            target_distance = 0x7FFF;
+            rel_angle = 0;
+        }
+
+        int16_t part_angle = (int16_t)(arctan(part->matrix_1._13, part->matrix_1._33)
+                                       - (int16_t)target_direction);
+        if ((actor->interact_state & 2)
+            && (part_angle > 0x3000 || part_angle < -0x3000)
+            && !interact_actor->hold_timer
+            && target_distance > (interact_actor->actor_rep_index == 3 ? 0x100 : 0x800))
+            los_blocked = 1;
+        if (!los_blocked) {
+            vector_t step;
+            set_vector(&step, dx, dy, dz);
+            int16_t max_dim = abs(dx);
+            if (abs(dy) > max_dim) max_dim = abs(dy);
+            if (abs(dz) > max_dim) max_dim = abs(dz);
+            int16_t subdivisions = max_dim / 64;
+            if (subdivisions >= 2)
+                div_vector(&step, subdivisions);
+            vector_t dst;
+            copy_vector(&dst, &part->ellipse_center);
+            if (subdivisions > 0) {
+                for (int sub_step = 0; sub_step < subdivisions; sub_step++) {
+                    add_vector(&dst, &step);
+                    if (find_height_now_vis(&dst) < dst.Y) {
+                        los_blocked = 1;
+                        break;
+                    }
+                }
+            }
+        }
+
+        actor->interact_state |= 1;
+        if (los_blocked) {
+            actor->interact_state &= 0xFFFE;
+            if (actor->interact_timer) {
+                int16_t dx = actor->target_position.X - actor->position_vector.X;
+                int16_t dz = actor->target_position.Z - actor->position_vector.Z;
+                int16_t dy = actor->target_position.Y - actor->position_vector.Y;
+                target_direction = arctan(dx, dz);
+                target_distance = (int16_t)(abs(dx) < abs(dz)
+                    ? abs(dx) / 2 + abs(dz)
+                    : abs(dz) / 2 + abs(dx));
+                if (abs(dy) <= 768 || abs(dy) <= target_distance)
+                    rel_angle = actor->rotate_vector.Y - (int16_t)target_direction;
+                else {
+                    interact_actor = NULL;
+                    target_distance = 0x7FFF;
+                    rel_angle = 0;
+                }
+                if (actor->actor_rep_index == 1
+                    && repertoire_tab[2] && repertoire_tab[2]->thing_index == actor->name_index) {
+                    actor->actor_rep_index = 2;
+                    actor->flags |= 0x40;
+                }
+            } else {
+                if (interact_actor->hold_timer) {
+                    if (actor->actor_rep_index == 1
+                        && repertoire_tab[2] && repertoire_tab[2]->thing_index == actor->name_index) {
+                        actor->actor_rep_index = 2;
+                        actor->flags |= 0x40;
+                    }
+                } else if (actor->actor_rep_index == 2) {
+                    actor->actor_rep_index = 1;
+                }
+                interact_actor = NULL;
+                target_distance = 0x7FFF;
+                rel_angle = 0;
+            }
+        } else {
+            actor->interact_timer = 5000;
+            copy_vector(&actor->target_position, &interact_actor->position_vector);
+            if (actor->actor_rep_index == 1
+                && repertoire_tab[2] && repertoire_tab[2]->thing_index == actor->name_index) {
+                actor->actor_rep_index = 2;
+                actor->flags |= 0x40;
+            }
+        }
+    }
+
+have_target:
+    if (actor->event_timer > 0) actor->event_timer -= game_time_arg;
+    if (actor->event_timer < 0) actor->event_timer = 0;
+    if (actor->hold_timer > 0) actor->hold_timer -= game_time_arg;
+    if (actor->hold_timer < 0) actor->hold_timer = 0;
+    if (actor->interact_timer > 0) actor->interact_timer -= game_time_arg;
+    if (actor->interact_timer < 0) actor->interact_timer = 0;
+    if (actor->interact_cooldown > 0) actor->interact_cooldown -= game_time_arg;
+    if (actor->interact_cooldown < 0) actor->interact_cooldown = 0;
+
+    /* anim_behaviour_428914+3CE: action_variant is a cooldown on re-deciding
+     * next_move, so the AI cannot flip between e.g. walk and turn every frame.
+     * Only the player and the hit/death states re-decide unconditionally. */
+    if (game_version == GAME_VERSION_E1) {
+        if (actor == selected_thing
+            || actor->actor_behavior == BH_GET_HIT
+            || actor->actor_behavior == BH_DYING
+            || actor->actor_behavior == BH_DEAD
+            || actor->actor_behavior == BH_RECOVERING
+            || ((actor->actor_behavior == BH_CHASE || actor->actor_behavior == BH_GO_CLOSER)
+                && actor->event_timer)) {
+            actor->action_variant = -1;
+        } else if (actor->action_variant >= 0) {
+            actor->action_variant = (int16_t)(actor->action_variant - game_time_arg);
+        }
+    } else {
+        actor->action_variant = -1;
+    }
+    if (actor->actor_behavior != BH_WANDER) {
+        if ((actor->actor_behavior != BH_CHASE && actor->actor_behavior != BH_GO_CLOSER)
+            || !actor->event_timer)
+            actor->wander_direction = 0;
+    }
+    if (actor->action_variant >= 0) {
+        next_move = actor->move_type;
+        goto center_function;
+    }
+    actor->action_variant = 20 * (uint16_t)(2 * my_rand()) >> 16;
+
+    int16_t attack_range = (game_version == GAME_VERSION_E1) ? 900 : 6000;
+
+    switch (actor->actor_behavior) {
+    case BH_STOP:
+    case BH_TURN_LEFT:
+    case BH_TURN_RIGHT:
+        if (!interact_actor || interact_actor->actor_hitpoints < 0
+            || actor->range_threshold <= 12288
+            || (game_version != GAME_VERSION_E1 && (actor->flags & 0x0200))) {
+            if (actor->action_delay < 0) {
+                actor->actor_behavior = BH_WANDER;
+                actor->action_delay = (int16_t)((1200 * (uint16_t)(2 * my_rand()) >> 16) + 60);
+            } else {
+                actor->action_delay -= game_time_arg;
+            }
+        } else if (target_distance >= attack_range) {
+            if (target_distance >= 4000) {
+                if (actor->action_delay < 0) {
+                    actor->actor_behavior = BH_WANDER;
+                    actor->action_delay = (int16_t)((1200 * (uint16_t)(2 * my_rand()) >> 16) + 60);
+                } else {
+                    actor->action_delay -= game_time_arg;
+                }
+            } else {
+                actor->actor_behavior = BH_CHASE;
+            }
+        } else {
+            actor->actor_behavior = BH_ATTACK;
+        }
+        break;
+
+    case BH_WANDER:
+        if (!interact_actor || interact_actor->actor_hitpoints < 0
+            || actor->range_threshold <= 12288 || target_distance >= 8000) {
+            if (target_distance >= 900) {
+                if (actor->action_delay < 0) {
+                    actor->actor_behavior = BH_STOP;
+                    if (actor == selected_thing)
+                        actor->action_delay = (int16_t)((60 * (uint16_t)(2 * my_rand()) >> 16) + 60);
+                    else
+                        actor->action_delay = (int16_t)((120 * (uint16_t)(2 * my_rand()) >> 16) + 60);
+                } else {
+                    actor->action_delay -= game_time_arg;
+                }
+            } else {
+                actor->actor_behavior = BH_RETREAT;
+            }
+        } else if (target_distance >= attack_range) {
+            if (target_distance < 8000)
+                actor->actor_behavior = BH_CHASE;
+        } else {
+            actor->actor_behavior = BH_ATTACK;
+        }
+        break;
+
+    case BH_CHASE:
+    case BH_ATTACK:
+        if (!interact_actor || interact_actor->actor_hitpoints < 0
+            || (game_version != GAME_VERSION_E1 && (actor->flags & 0x0200))) {
+            actor->actor_behavior = BH_STOP;
+            actor->action_delay = (int16_t)((600 * (uint16_t)(2 * my_rand()) >> 16) + 60);
+        } else {
+            if (target_distance >= 8000)
+                actor->actor_behavior = BH_WANDER;
+            else if (target_distance >= attack_range)
+                actor->actor_behavior = BH_GO_CLOSER;
+            else
+                actor->actor_behavior = BH_ATTACK;
+        }
+        break;
+
+    case BH_GO_CLOSER:
+        if (!interact_actor || interact_actor->actor_hitpoints < 0
+            || (game_version != GAME_VERSION_E1 && (actor->flags & 0x0200))) {
+            actor->actor_behavior = BH_STOP;
+            actor->action_delay = (int16_t)((600 * (uint16_t)(2 * my_rand()) >> 16) + 60);
+        } else if (target_distance >= 700) {
+            if (target_distance >= 8000)
+                actor->actor_behavior = BH_WANDER;
+            else
+                actor->actor_behavior = BH_GO_CLOSER;
+        } else {
+            actor->actor_behavior = BH_ATTACK;
+        }
+        break;
+
+    case BH_RETREAT:
+        if (!interact_actor || interact_actor->actor_hitpoints < 0 || actor->range_threshold <= 12288) {
+            if (target_distance > 1800)
+                actor->actor_behavior = BH_WANDER;
+        } else if (target_distance >= attack_range) {
+            actor->actor_behavior = BH_WANDER;
+        } else if (target_distance < 2000) {
+            actor->actor_behavior = BH_CHASE;
+        } else {
+            actor->actor_behavior = BH_ATTACK;
+        }
+        break;
+
+    case BH_JOYSTICK:
+        if (!joystick_control || actor != selected_thing)
+            actor->actor_behavior = BH_WANDER;
+        break;
+
+    case BH_DYING:
+        if (actor->flags & 0x40) {
+            make_dead(actor);
+        }
+        break;
+
+    case BH_SLEEP:
+        if (actor->flags & 8)
+            actor->actor_behavior = BH_WANDER;
+        break;
+
+    case BH_GET_HIT:
+        actor->range_threshold = 0x7FFF;
+        break;
+
+    case BH_RECOVERING:
+        if (game_version == GAME_VERSION_E1) {
+            if (actor->flags & 0x40) {
+                actor->actor_behavior = BH_STOP;
+                actor->action_delay = -1;
+            }
+        } else {
+            if ((actor->flags & 0x40) || !(actor->flags & 0x20FF))
+                actor->actor_behavior = BH_STOP;
+        }
+        break;
+
+    case BH_DEAD:
+        if (actor == selected_thing && actor->action_delay > 0) {
+            actor->action_delay -= game_time_arg;
+            if (actor->action_delay < 0)
+                actor->action_delay = 0;
+        }
+        break;
+
+    case BH_FOLLOW:
+        break;
+
+    default:
+        quit("unknown behaviour mode");
+        break;
+    }
+
+    switch (actor->actor_behavior) {
+    case BH_CHASE:
+    case BH_GO_CLOSER:
+        if (actor->event_timer)
+            next_move = do_new_wander(actor);
+        else {
+            if (abs(rel_angle) >= 4096)
+                next_move = (rel_angle <= 0) ? 5 : 3;
+            else
+                next_move = 1;
+        }
+        break;
+
+    case BH_RETREAT:
+        if (abs(rel_angle) <= 24576)
+            next_move = (rel_angle >= 0) ? 5 : 3;
+        else
+            next_move = 1;
+        break;
+
+    case BH_WANDER:
+        next_move = do_wander(actor);
+        break;
+
+    case BH_FOLLOW:
+        if (actor->actor_reperture && actor->actor_reperture->action_slots[48] >= 0
+            && target_distance < 700 && selected_thing) {
+            if (abs(selected_thing->rotate_vector.Y - (int16_t)target_direction - 128) < 6144
+                && (extra_keys_pressed[55] || ctrl_pressed || extra_keys_pressed[57] || alt_pressed)) {
+                next_move = 48;
+                one_shot_action = 1;
+            }
+        } else if (actor->interact_target_index < 0) {
+            next_move = do_wander(actor);
+        } else if (!thing_tab[actor->interact_target_index]) {
+            next_move = do_wander(actor);
+        } else {
+            int16_t dirn, dist;
+            dist = target_distance;
+            find_dirn_and_dist(&dirn, &dist,
+                thing_tab[actor->interact_target_index]->position_vector.X - actor->position_vector.X,
+                thing_tab[actor->interact_target_index]->position_vector.Z - actor->position_vector.Z);
+            dirn = (int16_t)target_direction;
+            dist = target_distance;
+            int16_t angle_diff = (int16_t)target_direction - actor->rotate_vector.Y;
+            if (actor->interact_state & 1) {
+                actor->interact_state &= 0xFFF9;
+                if (dist < 400) {
+                    if (abs(angle_diff) >= 4096)
+                        next_move = (angle_diff >= 0) ? 5 : 3;
+                    else
+                        next_move = 7;
+                    actor->interact_cooldown = 250;
+                } else if (dist <= 800) {
+                    if (actor->interact_cooldown)
+                        next_move = 1000;
+                    else if (abs(angle_diff) < 4096)
+                        next_move = 1000;
+                    else
+                        next_move = (angle_diff >= 0) ? 5 : 3;
+                } else {
+                    if (abs(angle_diff) >= 0x2000)
+                        next_move = (angle_diff >= 0) ? 5 : 3;
+                    else {
+                        next_move = 1;
+                        if (abs(angle_diff) > 4096) {
+                            if (angle_diff >= 0) turn_actor(actor, 512 * game_time_arg);
+                            else turn_actor(actor, -512 * game_time_arg);
+                        }
+                    }
+                    actor->interact_cooldown = 250;
+                }
+            } else if (actor->interact_state & 2) {
+                next_move = do_wander(actor);
+            } else {
+                if (target_distance < 400)
+                    actor->interact_state |= 4;
+                if (dist < 800 && (actor->interact_state & 4))
+                    next_move = 1;
+                else if (actor->interact_state & 4) {
+                    next_move = 1;
+                    actor->interact_state |= 2;
+                } else {
+                    if (abs(angle_diff) >= 0x2000)
+                        next_move = (angle_diff >= 0) ? 5 : 3;
+                    else {
+                        next_move = 1;
+                        if (abs(angle_diff) > 4096) {
+                            if (angle_diff >= 0) turn_actor(actor, game_time_arg << 9);
+                            else turn_actor(actor, -512 * game_time_arg);
+                        }
+                    }
+                }
+            }
+        }
+        break;
+
+    case BH_STOP:
+        next_move = 1000;
+        break;
+
+    case BH_ATTACK:
+        if (abs(rel_angle) >= 2048 && game_version == GAME_VERSION_E1) {
+            /* asm anim_behaviour_428914+B2A: E1 only turns on the spot here;
+             * the walk-and-turn band below 4096 is E2's. */
+            next_move = (rel_angle > 0) ? 3 : 5;
+        } else if (abs(rel_angle) >= 2048) {
+            if (abs(rel_angle) < 4096) {
+                next_move = 1;
+                if (actor->actor_reperture && actor->actor_reperture->action_slots[1] >= 0) {
+                    if (rel_angle <= 0) turn_actor(actor, 512 * game_time_arg);
+                    else turn_actor(actor, -512 * game_time_arg);
+                }
+            } else {
+                next_move = (rel_angle > 0) ? 3 : 5;
+            }
+        } else if (actor != selected_thing) {
+            next_move = actor->move_type;
+            if (next_move >= 9 && next_move != 1000 && !(actor->flags & 0x40))
+                goto center_function;
+            /* E1 has no LOS test here (anim_behaviour_428914+981). With
+             * 64 <= max_dim < 128 the raycast's only sample lands on the target
+             * and always reports blocked. */
+            if (game_version == GAME_VERSION_E1 || !los_blocked) {
+                if (game_version == GAME_VERSION_E1) {
+                    /* anim_behaviour_428914+981: three tiers; beyond 900 the actor
+                     * keeps its current move_type. */
+                    uint16_t random_value = 2 * my_rand();
+                    if (target_distance < 700) {
+                        if (random_value > 0xC000u)      next_move = 9;
+                        else if (random_value > 0x8000u) next_move = 10;
+                        else if (random_value > 0x4000u) next_move = 11;
+                        else                             next_move = 1000;
+                    } else if (target_distance < 900) {
+                        if (random_value > 0xC000u) {
+                            next_move = 1;
+                            actor->actor_behavior = BH_GO_CLOSER;
+                        }
+                        else if (random_value > 0x9000u) next_move = 9;
+                        else if (random_value > 0x6000u) next_move = 10;
+                        else if (random_value > 0x3000u) next_move = 11;
+                        else                             next_move = 1000;
+                    }
+                    /* asm anim_behaviour_428914+A17: an actor whose repertoire
+                     * has no action for the chosen attack uses a hand action
+                     * instead — how a non-fighter like the penitent begs. */
+                    if (next_move >= 9 && next_move <= 11 && actor->actor_reperture
+                        && actor->actor_reperture->action_slots[next_move] < 0)
+                        next_move = look_for_pick_up_e1(actor->_PartTab->field_0[0]) + 41;
+                } else {
+                    /* E2: three tiers with ranged attacks */
+                    int melee_only = 1;
+                    if (actor->actor_reperture && actor->actor_reperture->action_slots[80] >= 0)
+                        melee_only = 0;
+                    if (target_distance >= 900) {
+                        if (target_distance >= 3000) {
+                            uint16_t random_value = 2 * my_rand();
+                            one_shot_action = 1;
+                            if (random_value <= 0xAAAAu)
+                                next_move = (random_value <= 0x5555u) ? 17 : 16;
+                            else
+                                next_move = 15;
+                            if (actor->actor_reperture && actor->actor_reperture->action_slots[next_move] < 0) {
+                                next_move = 1; one_shot_action = 0;
+                            }
+                        } else {
+                            one_shot_action = 1;
+                            uint16_t random_value = 2 * my_rand();
+                            if (random_value <= 0xAAAAu)
+                                next_move = (random_value <= 0x5555u) ? 14 : 13;
+                            else
+                                next_move = 12;
+                            if (actor->actor_reperture && actor->actor_reperture->action_slots[next_move] < 0) {
+                                next_move = 1; one_shot_action = 0;
+                            }
+                        }
+                    } else {
+                        uint16_t random_value = 2 * my_rand();
+                        one_shot_action = 1;
+                        if (random_value <= 0xC000u) {
+                            if (melee_only) {
+                                if (random_value <= 0x8000u)
+                                    next_move = (random_value <= 0x4000u) ? 11 : 10;
+                                else
+                                    next_move = 9;
+                            } else {
+                                next_move = (int16_t)((9 * (uint16_t)(2 * my_rand()) >> 16) + 80);
+                            }
+                        } else {
+                            next_move = 1;
+                            one_shot_action = 0;
+                            actor->actor_behavior = BH_GO_CLOSER;
+                        }
+                    }
+                }
+                goto center_function;
+            }
+            next_move = 1;
+        } else if ((next_move && next_move != 2 && next_move != 4) || actor->move_type == 1000 || (actor->flags & 0x40)) {
+            if (target_distance >= 700) {
+                uint16_t random_value = 2 * my_rand();
+                if (random_value > 0xC000u) {
+                    next_move = 1; actor->actor_behavior = BH_GO_CLOSER;
+                } else if (random_value > 0x9000u) next_move = 0;
+                else if (random_value > 0x6000u) next_move = 4;
+                else if (random_value > 0x3000u) next_move = 2;
+            } else {
+                uint16_t random_value = 2 * my_rand();
+                if (random_value > 0xC000u) next_move = 0;
+                else if (random_value > 0x8000u) next_move = 4;
+                else if (random_value > 0x4000u) next_move = 2;
+            }
+            goto center_function;
+        }
+        break;
+
+    case BH_JOYSTICK: {
+        int walk_only = 1;
+        int key_right = extra_keys_pressed[77];
+        int key_left = extra_keys_pressed[75];
+        int key_down = extra_keys_pressed[80];
+        int key_up = extra_keys_pressed[72];
+
+        if (game_version == GAME_VERSION_E1) {
+            /* E1 BH_JOYSTICK (0x429452): no velocity pre-checks, and the
+             * diagonal turn uses move_direction. */
+            next_move = 1000;
+
+            if (ctrl_pressed && (key_up || key_down || key_left || key_right)) {
+                if (key_up) next_move = 0;
+                else if (key_left) next_move = 0;
+                else if (key_right) next_move = 2;
+                else if (key_down) next_move = 4;
+            } else if (key_left && key_up) {
+                next_move = 1;
+                turn_actor(actor, -(actor->move_direction << 4));
+            } else if (key_right && key_up) {
+                next_move = 1;
+                turn_actor(actor, actor->move_direction << 4);
+            } else if (extra_keys_pressed[71]) {
+                next_move = 0;
+            } else if (key_up) {
+                next_move = 1;
+            } else if (extra_keys_pressed[73]) {
+                next_move = 2;
+            } else if (key_left) {
+                next_move = 3;
+            } else if (key_right) {
+                next_move = 5;
+            } else if (extra_keys_pressed[56]) {
+                if (actor->_PartTab->field_0[1] && actor->_PartTab->field_0[1]->actor_2_held)
+                    next_move = 40;
+                else if (actor->_PartTab->field_0[0] && actor->_PartTab->field_0[0]->actor_2_held)
+                    next_move = 45;
+                else
+                    next_move = 39;
+            } else if (keys_pressed[42]) {
+                next_move = key_up ? 2 : 0;
+            } else if (extra_keys_pressed[79]) {
+                next_move = actor->move_type;
+                if (next_move < 36 || next_move > 40 || (actor->flags & 0x40))
+                    next_move = look_for_pick_up_e1(actor->_PartTab->field_0[1]) + 36;
+            } else if (key_down) {
+                next_move = 7;
+            } else if (extra_keys_pressed[81]) {
+                next_move = actor->move_type;
+                if (next_move < 41 || next_move > 45 || (actor->flags & 0x40))
+                    next_move = look_for_pick_up_e1(actor->_PartTab->field_0[0]) + 41;
+            } else if (space_pressed) {
+                /* Not in the original (numpad-only there); mirrors the key 79
+                 * branch, so it must use the part that owns slots 36..40. */
+                next_move = actor->move_type;
+                if (next_move < 36 || next_move > 40 || (actor->flags & 0x40))
+                    next_move = look_for_pick_up_e1(actor->_PartTab->field_0[1]) + 36;
+            }
+        } else {
+            /* E2: ctrl toggles run (uses different direction slots) */
+            bool use_run = ctrl_pressed;
+
+            if (actor->actor_reperture && actor->actor_reperture->action_slots[180] >= 0)
+                walk_only = 0;
+            next_move = 1000;
+
+            if (actor->actor_velocity.Y > 0) {
+                if (actor->move_type != 4) next_move = 24;
+                goto center_function;
+            }
+            if (actor->actor_velocity.Y < 0) {
+                next_move = 4;
+            } else if (space_pressed) {
+                next_move = actor->move_type;
+                if (next_move < 36 || next_move > 40 || (actor->flags & 0x40))
+                    next_move = look_for_pick_up(actor) + 36;
+            } else if (extra_keys_pressed[56]) { /* Left Alt — flip/roll */
+                if (actor->_PartTab->field_0[7] && actor->_PartTab->field_0[7]->actor_2_held)
+                    next_move = 40;
+                else if (actor->_PartTab->field_0[8] && actor->_PartTab->field_0[8]->actor_2_held)
+                    next_move = 45;
+                else
+                    next_move = 39;
+            } else if (keys_pressed[42]) { /* Left Shift — jump */
+                next_move = key_up ? 2 : 0;
+            } else if (ctrl_pressed && alt_pressed) {
+                int best_target = 0;
+                if (actor->actor_reperture && actor->actor_reperture->thing_index >= 0)
+                    best_target = find_best_target_up_down(actor);
+                if (best_target < 0) {
+                    if (key_up) { next_move = actor->move_type; if (next_move != 204) next_move = 208; }
+                    else if (key_left) { next_move = actor->move_type; if (next_move != 205) next_move = 209; }
+                    else if (key_right) { next_move = actor->move_type; if (next_move != 206) next_move = 210; }
+                    else if (key_down) { next_move = actor->move_type; if (next_move != 207) next_move = 211; }
+                } else {
+                    if (key_up) { next_move = actor->move_type; if (next_move != 208) next_move = 204; }
+                    else if (key_left) { next_move = actor->move_type; if (next_move != 209) next_move = 205; }
+                    else if (key_right) { next_move = actor->move_type; if (next_move != 210) next_move = 206; }
+                    else if (key_down) { next_move = actor->move_type; if (next_move != 211) next_move = 207; }
+                }
+            } else if (!use_run) {
+                if (alt_pressed) {
+                    if (key_up) next_move = 196;
+                    else if (key_left) next_move = 197;
+                    else if (key_right) next_move = 198;
+                    else if (key_down) next_move = 199;
+                } else if (key_left && key_up) {
+                    next_move = walk_only ? 1 : 180;
+                    turn_actor(actor, -16 * actor->move_direction);
+                } else if (key_right && key_up) {
+                    next_move = walk_only ? 1 : 180;
+                    turn_actor(actor, 16 * actor->move_direction);
+                } else if (!walk_only) {
+                    if (key_up) next_move = 180;
+                    else if (key_left) next_move = 181;
+                    else if (key_right) next_move = 182;
+                    else if (key_down) next_move = 183;
+                } else if (key_up) next_move = 1;
+                else if (key_left) next_move = 3;
+                else if (key_right) next_move = 5;
+                else if (key_down) next_move = 7;
+            } else { /* ctrl pressed, no alt */
+                if (walk_only) {
+                    if (key_up) next_move = 0;
+                    else if (key_left) next_move = 2;
+                    else if (key_right) next_move = 6;
+                    else if (key_down) next_move = 8;
+                } else {
+                    int bt = 0;
+                    if (actor->actor_reperture && actor->actor_reperture->action_slots[184] >= 0)
+                        bt = find_best_target_up_down(actor);
+
+                    int middle = 0, down = 0, up = 0;
+                    if (key_up)         { middle = 188; down = 184; up = 192; }
+                    else if (key_left)  { middle = 189; down = 185; up = 193; }
+                    else if (key_right) { middle = 190; down = 186; up = 194; }
+                    else if (key_down)  { middle = 191; down = 187; up = 195; }
+
+                    if (middle) {
+                        int a = actor->move_type;
+                        if (bt == 0) {
+                            if (a != down && a != up) a = middle;
+                        } else if (bt < 0) {
+                            if (a != middle && a != up) a = down;
+                        } else {
+                            if (a != middle && a != down) a = up;
+                        }
+                        next_move = a;
+                    }
+                }
+            }
+        }
+        goto center_function;
+    }
+
+    case BH_TURN_LEFT:
+        next_move = 3;
+        break;
+
+    case BH_TURN_RIGHT:
+        next_move = 5;
+        break;
+
+    case BH_GET_HIT: {
+        if (game_version == GAME_VERSION_E1) {
+            if (actor->actor_hitpoints < 0) {
+                uint16_t rv = 2 * my_rand();
+                next_move = (rv <= 0xAAAAu) ? 32 : 31;
+                actor->actor_behavior = BH_DYING;
+                thing_name_flags[actor->name_index] |= 4;
+            } else {
+                uint16_t rv = 2 * my_rand();
+                next_move = (rv <= 0xAAAAu) ? 35 : 34;
+                actor->actor_behavior = BH_RECOVERING;
+            }
+            goto center_function;
+        }
+        one_shot_action = 1;
+        int has_die_action = 0, has_fall_action = 0;
+        if (actor->actor_reperture) {
+            if (actor->actor_reperture->action_slots[31] >= 0) has_die_action = 1;
+            if (actor->actor_reperture->action_slots[150] >= 0) has_fall_action = 1;
+        }
+        if (!has_die_action && !has_fall_action)
+            actor->actor_hitpoints = 0;
+
+        if (actor->hit_type == 3) { /* hit_type == HitType::Fall */
+            if (actor->actor_hitpoints >= -50) {
+                next_move = (actor->actor_hitpoints >= 0) ? 28 : 29;
+            } else {
+                next_move = 27;
+            }
+            if (actor->actor_reperture && actor->actor_reperture->action_slots[next_move] < 0) {
+                if (actor->actor_hitpoints >= 0) next_move = 50;
+                else if (has_fall_action) next_move = 150;
+                else next_move = 31;
+            }
+            if (actor->actor_hitpoints >= 0)
+                actor->actor_behavior = BH_RECOVERING;
+            else {
+                actor->actor_behavior = BH_DYING;
+                thing_name_flags[actor->name_index] |= 4;
+            }
+        } else if (actor->actor_hitpoints < 0 && has_die_action) {
+            uint16_t random_value = 2 * my_rand();
+            if (random_value >= 0x5555u)
+                next_move = (random_value <= 0xAAAAu) ? 32 : 31;
+            else
+                next_move = 30;
+            actor->actor_behavior = BH_DYING;
+            thing_name_flags[actor->name_index] |= 4;
+        } else {
+            int16_t hit_octant = (((actor->rotate_vector.Y - actor->hit_angle) + 4096) >> 13) & 7;
+            int16_t dir_val = hit_dir_table[hit_octant];
+            if (actor->actor_hitpoints >= 0)
+                next_move = 3 * dir_val + 50;
+            else
+                next_move = 3 * dir_val + 150;
+
+            uint16_t random_value = 2 * my_rand();
+            if (dir_val == 3) {
+                if (random_value < 0x2AAAu) {
+                } else if (random_value < 0x5555u) {
+                    next_move++;
+                } else if (random_value >= 0x8000u) {
+                    if (random_value >= 0xAAAAu) {
+                        next_move += (random_value >= 0xD555u) ? 5 : 4;
+                    } else {
+                        next_move += 3;
+                    }
+                }
+            } else {
+                if (random_value >= 0x5555u && random_value < 0xAAAAu) {
+                    next_move++;
+                }
+            }
+
+            if (actor->actor_hitpoints >= 0)
+                actor->actor_behavior = BH_RECOVERING;
+            else {
+                actor->actor_behavior = BH_DYING;
+                thing_name_flags[actor->name_index] |= 4;
+            }
+        }
+        goto center_function;
+    }
+
+    case BH_DYING:
+        next_move = actor->move_type;
+        break;
+
+    case BH_RECOVERING:
+        if (game_version == GAME_VERSION_E1 &&
+            (!actor->actor_act.act_action || (actor->flags & 0x40))) {
+            actor->actor_behavior = BH_STOP;
+            actor->flags &= ~0x2000;
+            next_move = 0;
+        } else {
+            next_move = actor->move_type;
+        }
+        break;
+
+    case BH_DEAD:
+        next_move = -1;
+        break;
+
+    case BH_SLEEP:
+        break;
+
+    default:
+        quit("unknown behaviour mode");
+        break;
+    }
+
+center_function:
+    /* InbetweenPos calls for special repertoire types (simplified) */
+    if (actor->actor_reperture && actor->actor_reperture->rep_index > 0) {
+        int16_t rep_idx = actor->actor_reperture->rep_index;
+        bool is_ranged = (next_move >= 188 && next_move < 191) || (next_move >= 184 && next_move < 187) || (next_move >= 192 && next_move < 195);
+        if (rep_idx == 11) {
+            if (!is_ranged && (next_move != 205 && next_move != 209))
+                interpolate_pos(actor, game_time_arg, 4096);
+            else
+                interpolate_pos(actor, game_time_arg, 1280);
+        } else if (rep_idx == 14) {
+            if (is_ranged)
+                interpolate_pos(actor, game_time_arg, 1280);
+            else if (next_move == 204 || next_move == 208)
+                interpolate_pos(actor, game_time_arg, 4096);
+        } else if (rep_idx == 15) {
+            if (next_move == 184 || next_move == 188 || next_move == 192)
+                interpolate_pos(actor, game_time_arg, 4096);
+        } else if (rep_idx == 16) {
+            if (next_move == 184 || next_move == 188 || next_move == 192)
+                interpolate_pos(actor, game_time_arg, 4096);
+            else if (!is_ranged && (next_move == 205 || next_move == 209))
+                interpolate_pos(actor, game_time_arg, 4096);
+        } else {
+            if (is_ranged)
+                interpolate_pos(actor, game_time_arg, 1280);
+        }
+    }
+
+    if (next_move >= 0) {
+        if (!actor->actor_reperture || actor->actor_reperture->action_slots[next_move] < 0)
+            next_move = 1000;
+
+        if (next_move == 1000) {
+            /* Idle next_move */
+            if (!(actor->flags & 0x40)) {
+                if (1000 == actor->move_type)
+                    goto label_917;
+                /* anim_behaviour_428914+D8B: E1 keeps the running action only
+                 * when it is uninterruptible (0x40), or NPCs overshoot every turn. */
+                int keep_mask = (game_version == GAME_VERSION_E1) ? 0x40 : (0x40 | 0x20FF);
+                if ((game_version == GAME_VERSION_E1 || actor != selected_thing)
+                    && actor->actor_act.act_action
+                    && (actor->actor_act.flags & keep_mask))
+                    goto label_917;
+            }
+
+            action_t *current_action = NULL;
+            if (game_version == GAME_VERSION_E1) {
+                /* asm anim_behaviour_428914+D9E: E1 has no end_action_index
+                 * path here, and swaps the idle slot base while space is held. */
+                if (actor->actor_reperture) {
+                    int action_idx_rand = (int16_t)((6 * (uint16_t)(2 * my_rand())) >> 16);
+                    int idle_base = joy_button ? 23 : 17;
+                    int16_t actor_action = actor->actor_reperture->action_slots[idle_base + action_idx_rand];
+                    if (actor_action >= 0) {
+                        check_action_loaded(actor_action);
+                        current_action = action_tab[actor_action];
+                    }
+                }
+            } else if (actor->end_action_index < 0) {
+                if (actor->actor_reperture) {
+                    int action_idx_rand;
+                    int random_value = 100 * (2 * my_rand()) >> 16;
+                    if (random_value < 30) action_idx_rand = 0;
+                    else if (random_value < 55) action_idx_rand = 1;
+                    else if (random_value < 72) action_idx_rand = 2;
+                    else if (random_value < 85) action_idx_rand = 3;
+                    else if (random_value < 95) action_idx_rand = 4;
+                    else action_idx_rand = 5;
+
+                    if (action_idx_rand == actor->action_index) {
+                        action_idx_rand = actor->action_index + 1;
+                        if (action_idx_rand > 5) action_idx_rand = 0;
+                    }
+                    actor->action_index = (int16_t)action_idx_rand;
+                    int16_t actor_action = actor->actor_reperture->action_slots[18 + action_idx_rand];
+                    if (actor_action >= 0) {
+                        check_action_loaded(actor_action);
+                        current_action = action_tab[actor_action];
+                    }
+                }
+            } else {
+                check_action_loaded(actor->end_action_index);
+                current_action = action_tab[actor->end_action_index];
+            }
+
+            if (current_action) {
+                actor->actor_act.act_action = current_action;
+                actor->actor_act.duration = current_action->act_duration;
+                if (game_version != GAME_VERSION_E1 && actor->actor_Speed_factor != 100)
+                    actor->actor_act.duration = 100 * current_action->act_duration / actor->actor_Speed_factor;
+                actor->actor_act.key_progress = 0;
+                actor->actor_act.actor_keys_list = current_action->key_list;
+                actor->actor_act.flags = current_action->action_flags & 0xFFFE;
+                if (game_version != GAME_VERSION_E1) {
+                    if (actor->end_action_index >= 0)
+                        actor->actor_act.flags |= 0x20;
+                    actor->end_action_index = -1;
+                }
+            } else {
+                actor->actor_act.act_action = NULL;
+            }
+            update_thing(actor);
+            if (actor->actor_behavior != BH_RECOVERING && actor->actor_behavior != BH_GET_HIT)
+                actor->flags &= 0xDFFF;
+        } else {
+            /* Non-idle next_move from repertoire */
+            if (!(actor->flags & 0x40)) {
+                if (game_version == GAME_VERSION_E1) {
+                    if ((next_move == actor->move_type)
+                        || (actor->actor_act.act_action
+                            && (actor->actor_act.flags & 0x40)))
+                        goto label_917;
+                } else {
+                    if ((next_move == actor->move_type)
+                        || (actor->actor_act.act_action
+                            && (actor->actor_act.flags & 0x40)
+                            && actor->actor_behavior != BH_RECOVERING
+                            && actor->actor_behavior != BH_DYING))
+                        goto label_917;
+                }
+            }
+
+            action_t *current_action = NULL;
+            if (actor->actor_reperture) {
+                int16_t actor_action = actor->actor_reperture->action_slots[next_move];
+                int slot_ok = (game_version == GAME_VERSION_E1)
+                    ? (actor_action >= 0)
+                    : (actor->actor_reperture->rep_index >= 0);
+                if (slot_ok) {
+                    check_action_loaded(actor_action);
+                    current_action = action_tab[actor_action];
+                }
+            }
+
+            if (current_action) {
+                walk_trace_dump_rep(actor);
+                walk_trace_dump_action(current_action);
+                WTRACE("RESTART actor=%d nm=%d mt=%d act=%d dur=%d aflags=%04x bh=%d rel=%d rotY=%d tdir=%d wd=%d tdist=%d evt=%d ist=%04x tflags=%04x kp=%u\n",
+                       actor->name_index, next_move, actor->move_type,
+                       current_action->action_index, current_action->act_duration,
+                       current_action->action_flags, actor->actor_behavior,
+                       rel_angle, actor->rotate_vector.Y, target_direction,
+                       actor->wander_direction, target_distance, actor->event_timer,
+                       actor->interact_state, actor->flags,
+                       actor->actor_act.key_progress);
+                actor->actor_act.act_action = current_action;
+                actor->actor_act.duration = current_action->act_duration;
+                if (game_version != GAME_VERSION_E1 && actor->actor_Speed_factor != 100)
+                    actor->actor_act.duration = 100 * current_action->act_duration / actor->actor_Speed_factor;
+                actor->actor_act.key_progress = 0;
+                actor->actor_act.actor_keys_list = current_action->key_list;
+                actor->actor_act.flags = current_action->action_flags;
+                if (game_version != GAME_VERSION_E1 && actor->actor_behavior == BH_RECOVERING)
+                    actor->actor_act.flags &= 0xFFFE;
+                if (game_version == GAME_VERSION_E1) {
+                    /* asm anim_behaviour_428914+F1D: unconditional `or 40h`, and
+                     * the -1 lands on the action's following-action index, not
+                     * the actor's end_action_index. */
+                    if (next_move >= 36 && next_move <= 45) {
+                        actor->actor_act.flags |= 0x40;
+                        current_action->next_action_index = -1;
+                    }
+                } else {
+                    if ((next_move >= 36 && next_move <= 45) || one_shot_action) {
+                        if (!(actor->actor_act.flags & 1))
+                            actor->actor_act.flags |= 0x40;
+                    }
+                    actor->end_action_index = -1;
+                }
+            } else {
+                actor->actor_act.act_action = NULL;
+            }
+            update_thing(actor);
+            if (game_version == GAME_VERSION_E1) {
+                if (actor->actor_behavior != BH_RECOVERING && actor->actor_behavior != BH_GET_HIT)
+                    actor->flags &= 0xDFFF;
+            } else {
+                if (actor->actor_behavior != BH_RECOVERING && actor->actor_behavior != BH_GET_HIT
+                    && (!actor->actor_act.act_action || !(actor->actor_act.flags & 0x80)))
+                    actor->flags &= 0xDFFF;
+            }
+        }
+        actor->move_type = next_move;
+    }
+
+label_917:
+    actor->state_flags &= 0xFFFB;
+    action_t *cur_action = actor->actor_act.act_action;
+    actor->flags &= 0xFFBF;
+    if (cur_action) {
+        cur_action->action_time = game_time;
+        if (cur_action->key_list && cur_action->key_list->key_event_list)
+            actor_last_act[actor->name_index] = cur_action->next_action_index + 1;
+    }
+    uint16_t kp_before = actor->actor_act.key_progress;
+    advance_act(&actor->actor_act, actor, game_time_arg);
+    if (walk_trace_on() && (actor == selected_thing || actor->name_index == walk_trace_actor())) {
+        act_t *a = &actor->actor_act;
+        WTRACE("FRAME actor=%d gt=%d nm=%d mt=%d act=%d dur=%d kp %u->%u aflags=%04x tflags=%04x sflags=%04x bh=%d rel=%d rotY=%d tdir=%d wd=%d tdist=%d key=%d\n",
+               actor->name_index, game_time_arg, next_move, actor->move_type,
+               a->act_action ? a->act_action->action_index : -1,
+               a->duration, kp_before, a->key_progress, a->flags, actor->flags,
+               actor->state_flags, actor->actor_behavior, rel_angle,
+               actor->rotate_vector.Y, target_direction, actor->wander_direction,
+               target_distance,
+               a->actor_keys_list ? (int)a->actor_keys_list->KEY_position : -1);
+    }
+    if (actor->actor_act.act_action) {
+        if ((int32_t)actor->actor_act.duration * actor->actor_act.key_progress >> 16 > 20) {
+            if (actor->actor_reperture && actor->actor_reperture->action_slots[9] >= 0)
+                actor->flags &= 0xDFFF;
+        }
+    }
+    if (game_version != GAME_VERSION_E1) {
+        if (actor == selected_thing
+            || (actor->actor_reperture && actor->actor_reperture->action_slots[1] >= 0))
+            update_velocity(actor);
+    }
+
+    if (actor->actor_act.act_action) {
+        if (!(actor->actor_act.flags & 1) && actor->actor_act.key_progress == 0xFFFF) {
+            actor->flags |= 0x40;
+            if (actor->actor_act.flags & 0x1000) {
+                remove_from_display_list(actor);
+                thing_name_flags[actor->name_index] &= 0xFFFD;
+            }
+            actor->actor_act.act_action = NULL;
+        }
+    } else {
+        actor->flags |= 0x40;
+    }
+}
+
+/* move_unmake2_part_limb  E1: 0x426B14 | E2: 0x42D590 */
+void unmake2_part_limb(actor_t *actor) {
+    if (!actor) return;
+    actor->flags &= ~0x20;  /* Clear 2-part limb flag */
+}
+
+/* move_check_steps  E1: ? | E2: 0x429FC8 */
+void check_steps(void) {
+}
+
+/* move_recover_hit_points  E1: ? | E2: 0x42A67C */
+void recover_hit_points(void) {
+}
+
+/* move_find_free_act  E1: 0x4263FC | E2: 0x42CE78 */
+act_t *find_free_act(void) {
+    for (int i = 0; i < ACT_SIZE; ++i) {
+        if (!(act_arr[i].flags & 0x100)) {
+            act_arr[i].flags = 0x100;
+            return &act_arr[i];
+        }
+    }
+    return NULL;
+}
+
+/* move_spawn_action  E1: 0x42644C | E2: 0x42CEC8 */
+void spawn_action(event_t *event, actor_t *actor, int some_time) {
+    act_t *act = find_free_act();
+    if (act) {
+        act->act_action = action_tab[event->param1];
+        act->duration = event->param2;
+        act->loop_count = event->param3 & 0xFF;
+        act->anim_param = (event->param3 >> 8) & 0xFF;
+        act->key_progress = 0;
+        act->actor_keys_list = act->act_action->key_list;
+        update_act(act, actor, some_time);
+        if (act->flags & 0x0400) {
+            act->flags = 0;
+        } else {
+            if (actor->actor_act_list) {
+                act_t *tail = actor->actor_act_list;
+                while (tail->next)
+                    tail = tail->next;
+                tail->next = act;
+                act->next = NULL;
+            } else {
+                actor->actor_act_list = act;
+                act->next = NULL;
+            }
+        }
+    } else {
+        beep_error("can't spawn action");
+    }
+}
+
+/* move_complete_act  E1: 0x42489C | E2: 0x42AF78 */
+void complete_act(act_t *act, actor_t *actor) {
+    if (!act || !actor || !act->act_action) return;
+
+    for (key_state_t *key = act->actor_keys_list; key; key = key->next) {
+        for (event_t *event = key->key_event_list; event; event = event->next) {
+            /* asm move_complete_act_42B004+1C: `mov ebx, 0FFFFh` zero-extends
+             * to 65535 in 32-bit ebx; spawn_action then reads it as uint16. */
+            modify_part(event, actor, 0xFFFF, act->act_action);
+        }
+    }
+
+    act->actor_keys_list = act->act_action->key_list;
+    act->key_progress = 0;
+    if (act->act_action->action_flags & 4)
+        update_thing(actor);
+}
+
+/* move_position_act  E1: 0x424AA4 | E2: 0x42B2AC */
+void position_act(act_t *act, uint16_t some_duration, actor_t *actor) {
+    if (!act || !actor || !act->act_action) return;
+
+    if (some_duration < act->key_progress)
+        complete_act(act, actor);
+
+    key_state_t *key;
+    for (key = act->actor_keys_list; key; key = key->next) {
+        if (some_duration < key->KEY_position)
+            break;
+
+        int16_t some_time;
+        if (act->act_action->action_flags & 2)
+            some_time = (int16_t)(some_duration - key->KEY_position);
+        else
+            some_time = (int16_t)(act->duration * (some_duration - key->KEY_position) >> 16);
+
+        for (event_t *event = key->key_event_list; event; event = event->next) {
+            modify_part(event, actor, some_time, act->act_action);
+        }
+
+        if (key == act->actor_keys_list && !(act->act_action->action_flags & 2))
+            default_modifieds(actor);
+
+        act->key_progress = key->KEY_position;
+    }
+
+    if (key) {
+        int denom = key->KEY_position - act->key_progress;
+        if (denom > 0) {
+            int some_time = ((some_duration - act->key_progress) << 14) / denom;
+            if (some_time) {
+                for (event_t *event = key->key_event_list; event; event = event->next)
+                    advance_part(event, (int16_t)some_time, actor, act->act_action);
+
+                if (!(act->act_action->action_flags & 2))
+                    advance_def_modifieds(actor, some_time);
+            }
+        }
+    }
+
+    act->actor_keys_list = key;
+    act->key_progress = some_duration;
+}
+
+/* move_free_spent_acts */
+void free_spent_acts(actor_t *actor) {
+    if (!actor || !actor->actor_act_list) return;
+
+    for (act_t *act = actor->actor_act_list; act; act = act->next) {
+        if (!(act->flags & 0x400)) break;
+        act->flags = 0;
+    }
+
+    for (act_t *act = actor->actor_act_list; act && act->next; act = act->next) {
+        if (act->next->flags & 0x400) {
+            act->next->flags = 0;
+            act->next = act->next->next;
+        }
+    }
+}
+
+/* move_default_modifieds */
+void default_modifieds(actor_t *actor) {
+    if (!actor) return;
+    for (part_t *part = actor->actor_parts_list; part; part = part->next_in_display_list) {
+        int16_t v2 = part->def_pos_flags;
+        if (v2) {
+            part->def_pos_flags = ~part->position_flags & v2;
+            int flags = part->def_pos_flags;
+            if (flags & 1)
+                copy_vector(&part->AbsPosition, &part->def_position);
+            if (flags & 2)
+                copy_vector(&part->Rotate, &part->def_rotate);
+            if (flags & 4) {
+                copy_vector(&part->Offset, &part->def_offset);
+                calc_rel_offset(part);
+            }
+            if (flags & 8) {
+                copy_vector(&part->VECTOR_RelCentre, &part->def_RelCentre);
+                calc_rel_centre(part);
+            }
+            if (flags & 0x10) {
+                copy_vector(&part->VECTOR_Squash, &part->def_Squash);
+                calculate_squash(part);
+                update_relatives(part);
+            }
+            if (flags & 0x20)
+                part->color = part->default_color;
+            part->def_pos_flags = 0;
+        }
+    }
+}
+
+/* move_find_dirn_and_dist_428548 — see find_direction_and_distance for the
+ * truncate-then-abs note. */
+void find_dirn_and_dist(int16_t *dir, int16_t *dist, int16_t dx, int16_t dz) {
+    if (!dir || !dist) return;
+
+    uint16_t angle = arctan(dx, dz);
+    *dir = (int16_t)angle;
+
+    int abs_dx = abs(dx);
+    int abs_dz = abs(dz);
+    int d;
+    if (dx || dz) {
+        if (abs_dz <= abs_dx) {
+            int value = sine_table[angle];
+            d = value ? ((int)dx << 14) / value : 0;
+        } else {
+            int value = cosn_table[angle];
+            d = value ? ((int)dz << 14) / value : 0;
+        }
+    } else {
+        d = 0;
+    }
+    int16_t low = (int16_t)d;
+    *dist = (int16_t)(low < 0 ? -low : low);
+}
+
+/* move_find_direction_and_distance_427160 — truncates d to int16 before abs(),
+ * as the original does. Unlike find_dirn_and_dist (X = sin, Z = cos), this uses
+ * X = cos, Z = sin. */
+void find_direction_and_distance(int16_t *dir, int16_t *dist, int16_t dx, int16_t dz) {
+    uint16_t angle = arctan(dz, dx);
+    *dir = (int16_t)angle;
+
+    if (!dx && !dz) {
+        *dist = 0;
+        return;
+    }
+
+    int d;
+    if (abs(dx) > abs(dz)) {
+        int value = cosn_table[angle];
+        d = value ? ((int)dx << 14) / value : 0;
+    } else {
+        int value = sine_table[angle];
+        d = value ? ((int)dz << 14) / value : 0;
+    }
+    int16_t low = (int16_t)d;
+    *dist = (int16_t)(low < 0 ? -low : low);
+}
+
+/* move_turn_actor_42490C — rebuild matrix33_2 from rotate_vector */
+void turn_actor(actor_t *actor, int16_t angle) {
+    if (!actor) return;
+    actor->rotate_vector.Y += angle;
+    actor->state_flags |= 2;
+    make_identity(&actor->matrix33_2);
+    if (actor->rotate_vector.Y)
+        rotate_about_y(&actor->matrix33_2, actor->rotate_vector.Y);
+    if (actor->rotate_vector.X)
+        rotate_about_x(&actor->matrix33_2, actor->rotate_vector.X);
+    if (actor->rotate_vector.Z)
+        rotate_about_z(&actor->matrix33_2, actor->rotate_vector.Z);
+}
+
+/* move_make_dead  E1: 0x4236AC | E2: 0x42739C */
+void make_dead(actor_t *actor) {
+    if (!actor) return;
+
+    if (actor->actor_reperture &&
+        (actor->actor_reperture->action_slots[80] >= 0 ||
+         actor->actor_reperture->action_slots[9] >= 0) &&
+        actor != selected_thing)
+        ++kill_count;
+
+    actor->actor_behavior = BH_DEAD;
+    if (actor->actor_reperture) {
+        actor->actor_reperture->rep_use_flag &= 0xFFFD;
+        actor->actor_reperture = NULL;
+    }
+    actor->actor_rep_index = -1;
+    actor->flags |= 0x400;
+    actor->action_delay = 200;
+    thing_name_flags[actor->name_index] |= 4;
+
+    int code_idx = actor->dead_code_index;
+    if (code_idx >= 0) {
+        if (code_tab[code_idx])
+            execute_thing_code(actor, (int16_t)code_idx);
+        else {
+            char str1[104], str2[104];
+            sprintf(str1, "Actor: %s", thing_names[actor->name_index].field_0);
+            sprintf(str2, "Code:  %s", code_names[code_idx].field_0);
+            do_info3_req("Can't find DeadCode", str1, str2);
+        }
+    }
+}
+
+/* move_smart_bomb_4287B8 — SmartBomb(actor, range, damage) */
+void smart_bomb(actor_t *attacker, int range, int damage) {
+    if (!attacker || !root_thing) return;
+
+    int max_range = 100 * range;
+    int min_damage = 5 * damage / 100;
+    int max_damage = 40 * damage / 100;
+
+    for (actor_t *victim = root_thing; victim; victim = victim->next_in_display_list) {
+        if (!victim->actor_reperture) continue;
+        if (thing_name_flags[victim->name_index] & 4) continue;
+        rephead_t *vrep = victim->actor_reperture;
+        /* Needs Interact, and must be a walker (WalkLeft loaded) or the hero. */
+        if (vrep->action_slots[34] < 0) continue;
+        if (vrep->action_slots[3] < 0 && victim != selected_thing) continue;
+        if (victim == attacker) continue;
+
+        int dx = victim->position_vector.X - attacker->position_vector.X;
+        int dz = victim->position_vector.Z - attacker->position_vector.Z;
+        int abs_dx = abs(dx);
+        int abs_dz = abs(dz);
+        if (abs_dx >= max_range || abs_dz >= max_range) continue;
+
+        uint16_t angle = arctan(dx, dz);
+        int dist = 0;
+        if (dx || dz) {
+            if (abs_dz <= abs_dx) {
+                dist = sine_table[angle];
+                if (dist) dist = (dx << 14) / dist;
+            } else {
+                dist = cosn_table[angle];
+                if (dist) dist = (dz << 14) / dist;
+            }
+        }
+        if (dist < 0) dist = -dist;
+
+        int dy = abs(victim->position_vector.Y - attacker->position_vector.Y);
+        if (dist + dy >= max_range) continue;
+
+        victim->hit_type = 1;  /* HitType::Normal */
+        victim->hit_angle = (int16_t)arctan(dx, dz);
+
+        if (attacker->actor_hit_code < 0) {
+            victim->actor_behavior = BH_GET_HIT;
+            victim->flags |= 0x2000;   /* CannotBeHit */
+
+            int applied_damage;
+            if (victim == selected_thing && no_die)      applied_damage = 0;
+            else if (victim == selected_thing)           applied_damage = min_damage;
+            else                                         applied_damage = max_damage;
+
+            if (victim == selected_thing) {
+                int factor = armour_factor ? armour_factor : 1;
+                int scale = (difficulty == 0) ? 50 : (difficulty == 1) ? 100 : 200;
+                victim->actor_hitpoints -= (int16_t)(scale * applied_damage / factor);
+            } else {
+                victim->actor_hitpoints -= (int16_t)applied_damage;
+            }
+        } else {
+            if (attacker->actor_hit_code >= 0 && attacker->actor_hit_code < CODE_TAB_SIZE) {
+                code_t *hc = code_tab[attacker->actor_hit_code];
+                if (hc) execute_sub_obj_code(hc, victim, attacker, victim);
+            }
+        }
+
+        if (victim->code_at_hp_change >= 0 && victim->code_at_hp_change < CODE_TAB_SIZE) {
+            code_t *hpc = code_tab[victim->code_at_hp_change];
+            if (hpc) execute_sub_obj_code(hpc, victim, attacker, victim);
+        }
+
+        if (victim == selected_thing)
+            draw_life_bar();
+    }
+}
+
+/* move_modify_part  E1: 0x424FEC | E2: 0x42B7F4 */
+void modify_part(event_t *event, actor_t *actor, int some_time, action_t *action) {
+    if (!event) return;
+
+    int16_t et_flags = event_type_flags[event->event_type];
+
+    /* 0x425000: while an act is wound forward to its end state (complete_act
+     * during scene setup / swap-in), only NO_SUPRESS pose events apply, so
+     * pick-ups, put-downs and HoldThingWithPart do not fire. */
+    if (suppress_events && !(et_flags & EVENT_FLAGS_NO_SUPRESS)) return;
+    if (event->event_type == INTERACT)
+        WTRACE("MP INTERACT actor=%d act=%d etflags=%04x ev_idx=%d p1=%d p2=%d parttab=%p\n",
+               actor ? actor->name_index : -1,
+               action ? action->action_index : -1, et_flags, event->event_index,
+               event->param1, event->param2,
+               (actor && actor->_PartTab) ? (void *)actor->_PartTab->field_0[event->event_index < 0 ? 0 : event->event_index] : NULL);
+
+    switch (event->event_type) {
+    case ADD_THING: {
+        actor_t *new_actor = add_thing();
+        selected_thing = new_actor;
+        new_actor->name_index = event->param1;
+        new_actor->last_actor_direction = last_actor_dir;
+        thing_tab[new_actor->name_index] = new_actor;
+        return;
+    }
+    case ADD_PART_TO_THING: {
+        if (!actor) return;
+        part_t *p = add_part(actor);
+        if (!p) return;
+        p->name_index = event->param1;
+        if (actor->_PartTab)
+            actor->_PartTab->field_0[event->param1] = p;
+        return;
+    }
+    default:
+        break;
+    }
+
+    if (!actor) return;
+
+    part_t *part = NULL;
+    point_t *point = NULL;
+    tri_t *triangle = NULL;
+
+    if (et_flags & 0x10) {
+        if (event->event_index < 0) return;
+        if (et_flags & 0x200) {
+            for (part_t *p = actor->actor_parts_list; p; p = p->next_in_display_list) {
+                if (p->actor_2_held && p->actor_2_held->_PartTab) {
+                    part = p->actor_2_held->_PartTab->field_0[event->event_index];
+                    if (part) break;
+                }
+            }
+            if (!part) return;
+            actor = part->parent_actor;
+        } else {
+            if (actor->_PartTab)
+                part = actor->_PartTab->field_0[event->event_index];
+            /* 0x425075..0x4250D5: E1 drops the event when the actor has no part
+             * with this index. The redirect to held objects below is E2-only. */
+            if (game_version == GAME_VERSION_E1 && !part) return;
+            if (!part) {
+                if (actor->part_heap_link) {
+                    actor = actor->part_heap_link->parent_actor;
+                    if (!(actor->state_flags & 1)) {
+                        if (event->event_type != INTERACT) return;
+                    } else {
+                        if (actor->_PartTab)
+                            part = actor->_PartTab->field_0[event->event_index];
+                    }
+                    if (!part && event->event_type != INTERACT) return;
+                } else {
+                    actor_t *from = actor;
+                    for (part_t *p = actor->actor_parts_list; p; p = p->next_in_display_list) {
+                        if (p->actor_2_held && p->actor_2_held->_PartTab) {
+                            part = p->actor_2_held->_PartTab->field_0[event->event_index];
+                            if (part) break;
+                        }
+                    }
+                    if (!part && event->event_type != INTERACT) return;
+                    if (part) {
+                        actor = part->parent_actor;
+                        /* ECSTATICA_TRACE_REDIRECT=1: the owning actor has no part
+                         * with this index, so the event lands on a held object
+                         * instead. E2-only; E1 returns above. */
+                        static int on = -1, n = 0;
+                        if (on < 0) {
+                            const char *e = getenv("ECSTATICA_TRACE_REDIRECT");
+                            on = (e && *e && *e != '0') ? 1 : 0;
+                        }
+                        if (on && n < 400 && actor != from) {
+                            n++;
+                            fprintf(stderr, "[REDIR] ev_type=%d ev_idx=%d from actor=%d '%s' "
+                                            "-> held actor=%d '%s' part=%d\n",
+                                    event->event_type, event->event_index,
+                                    from->name_index,
+                                    (from->name_index >= 0 && from->name_index < THING_TAB_SIZE)
+                                        ? thing_names[from->name_index].field_0 : "?",
+                                    actor->name_index,
+                                    (actor->name_index >= 0 && actor->name_index < THING_TAB_SIZE)
+                                        ? thing_names[actor->name_index].field_0 : "?",
+                                    part->name_index);
+                            fflush(stderr);
+                        }
+                    }
+                }
+            }
+        }
+    } else if (et_flags & 0x20) {
+        /* ADD_TRIANGLE creates its target, so it falls through to the handler. */
+        if (event->event_index < 0) return;
+        if (actor->_TriangleTab)
+            triangle = actor->_TriangleTab->field_0[event->event_index];
+        if (!triangle && event->event_type != ADD_TRIANGLE) return;
+    } else if (et_flags & 0x40) {
+        if (event->event_index < 0) return;
+        if (actor->_PointTab)
+            point = actor->_PointTab->field_0[event->event_index];
+        if (!point) return;
+    }
+
+    switch (event->event_type) {
+    case ROTATE_THING: {
+        part_t *wp = actor->part_heap_link;
+        if (wp && (wp->parent_actor->state_flags & 1))
+            actor = wp->parent_actor;
+        if (actor->state_flags & 0x20) {
+            update_thing(actor);
+            actor->state_flags &= ~0x20;
+        }
+        actor->rotate_vector.X += event->param1 - actor->Rotate.X;
+        actor->rotate_vector.Y += event->param2 - actor->Rotate.Y;
+        actor->rotate_vector.Z += event->param3 - actor->Rotate.Z;
+        set_vector(&actor->Rotate, event->param1, event->param2, event->param3);
+        break;
+    }
+    case MOVE_THING: {
+        part_t *wp = actor->part_heap_link;
+        if (wp && (wp->parent_actor->state_flags & 1))
+            actor = wp->parent_actor;
+        if (actor->state_flags & 0x20) {
+            update_thing(actor);
+            actor->state_flags &= ~0x20;
+        }
+        vector_t input, output;
+        input.X = event->param1 - actor->Offset.X;
+        input.Y = event->param2 - actor->Offset.Y;
+        input.Z = event->param3 - actor->Offset.Z;
+        set_vector(&actor->Offset, event->param1, event->param2, event->param3);
+        c_matrix_vector(&output, &actor->matrix33_2, &input);
+        update_position(actor, &output);
+        check_visibility(actor);
+        break;
+    }
+    case SCRIPT_MOVE:
+        set_vector(&actor->position_vector, event->param1, event->param2, event->param3);
+        update_thing(actor);
+        break;
+    case SCRIPT_TURN:
+        set_vector(&actor->rotate_vector, event->param1, event->param2, event->param3);
+        update_thing(actor);
+        break;
+    case SPAWN_ACTION:
+        spawn_action(event, actor, some_time);
+        break;
+    case START_POSITION:
+        set_vector(&actor->start_position, event->param1, event->param2, event->param3);
+        break;
+    case HELD_OFFSET:
+        set_vector(&actor->held_offset, event->param1, event->param2, event->param3);
+        break;
+    case HELD_ROTATE:
+        set_vector(&actor->held_rotate, event->param1, event->param2, event->param3);
+        break;
+    case HELD_OFF_LEFT:
+        set_vector(&actor->held_off_left, event->param1, event->param2, event->param3);
+        break;
+    case HELD_ROT_LEFT:
+        set_vector(&actor->held_rot_left, event->param1, event->param2, event->param3);
+        break;
+    case THING_FLAGS:
+        actor->flags = (event->param3 & event->param1) | (~event->param3 & actor->flags);
+        if (event->param3 == -1)
+            actor->state_flags = event->param2;
+        if (event->param3 == -1 && (thing_name_flags[actor->name_index] & 0x40)) {
+            if (thing_name_flags[actor->name_index] & 0x10)
+                actor->flags |= 0x1000;
+            else
+                actor->flags &= ~0x1000;
+            if (thing_name_flags[actor->name_index] & 0x20)
+                actor->flags |= 0x20;
+            else
+                actor->flags &= ~0x20;
+        } else {
+            if (actor->flags & 0x1000) thing_name_flags[actor->name_index] |= 0x10;
+            else thing_name_flags[actor->name_index] &= ~0x10;
+            if (actor->flags & 0x20) thing_name_flags[actor->name_index] |= 0x20;
+            else thing_name_flags[actor->name_index] &= ~0x20;
+            if (event->param3 == -1) thing_name_flags[actor->name_index] |= 0x40;
+        }
+        break;
+    case THING_CODE:
+        actor->code_at_hp_change = event->param1 - 1;
+        actor->actor_hit_code = event->param2 - 1;
+        actor->actor_init_code = event->param3 - 1;
+        break;
+    case THING_CODE_2:
+        actor->picked_up_code = event->param1 - 1;
+        actor->dead_code_index = event->param2 - 1;
+        break;
+    case REORIENT_THING:
+        actor->state_flags |= 0x20;
+        break;
+    case BACKGROUND:
+        if (event->param1 == 1) {
+            if (actor->flags & 0x400)
+                clear_a_stuck_thing(actor);
+            actor->flags &= ~0x400;
+        } else
+            actor->flags |= 0x400;
+        break;
+    case ROTATE:
+    case N68:
+        if (!part) break;
+        set_vector(&part->Rotate, event->param1, event->param2, event->param3);
+        part->flags &= ~0x4200;
+        part->position_flags |= 2;
+        break;
+    case OFFSET:
+        if (!part) break;
+        set_vector(&part->Offset, event->param1, event->param2, event->param3);
+        calc_rel_offset(part);
+        part->position_flags |= 4;
+        break;
+    case POSITION:
+    case N69:
+        if (!part) break;
+        set_vector(&part->AbsPosition, event->param1, event->param2, event->param3);
+        part->flags &= ~0x4200;
+        part->position_flags |= 1;
+        break;
+    case DISP_PNT:
+        if (!part) break;
+        set_vector(&part->displacement_point, event->param1, event->param2, event->param3);
+        break;
+    case VECTOR1: {
+        if (!part) break;
+        squash_trace("set", part, some_time, event, &part->VECTOR_Squash, action);
+        set_vector(&part->VECTOR_Squash, event->param1, event->param2, event->param3);
+        calculate_squash(part);
+        update_relatives(part);
+        part->position_flags |= 0x10;
+        break;
+    }
+    case VECTOR2:
+        if (!part) break;
+        set_vector(&part->VECTOR_RelCentre, event->param1, event->param2, event->param3);
+        calc_rel_centre(part);
+        part->position_flags |= 8;
+        break;
+    case COLOUR:
+        if (!part) break;
+        part->color = (uint8_t)event->param1;
+        part->position_flags |= 0x20;
+        break;
+    case SHADE:
+        if (!part) break;
+        part->color_shade = event->param1;
+        break;
+    case TYPE:
+        if (!part) break;
+        part->type = (uint16_t)event->param1;
+        break;
+    case FLAGS:
+        if (!part) break;
+        part->flags = event->param1 | (~event->param2 & part->flags);
+        break;
+    case END_ACTION:
+        actor->end_action_index = event->param1;
+        break;
+    case ABSOLUTE_POS:
+        if (!part) break;
+        set_vector(&part->AbsPosition, event->param1, event->param2, event->param3);
+        if (action && action->action_flags & 2)
+            part->flags |= 0x0200;
+        else
+            part->flags |= 0x4200;
+        break;
+    case ABSOLUTE_ROT:
+        if (!part) break;
+        set_vector(&part->Rotate, event->param1, event->param2, event->param3);
+        if (action && action->action_flags & 2)
+            part->flags |= 0x0200;
+        else
+            part->flags |= 0x4200;
+        break;
+    case OFFSET_POINT:
+        if (!point) break;
+        set_vector(&point->offset_point, event->param1, event->param2, event->param3);
+        break;
+    case COLOUR_TRIANGLE:
+        if (!triangle) break;
+        triangle->tri_color_3 = event->param1;
+        triangle->tri_color_4 = event->param2;
+        if (event->param2 >= 16)
+            triangle->tri_color_4 = 1;
+        if (event->param3 & 0x8000)
+            triangle->shade_multiplier = event->param3 & 0x7FFF;
+        break;
+    case TRIANGLE_FLAGS:
+        if (!triangle) break;
+        triangle->tri_use_flag = (event->param2 & event->param1) | (~event->param2 & triangle->tri_use_flag);
+        break;
+    case ACTOR_REP:
+        actor->actor_rep_index = event->param1;
+        if (event->param2)
+            actor->default_repert = event->param3;
+        break;
+    case DEF_ROTATE:
+        if (!part) break;
+        set_vector(&part->def_rotate, event->param1, event->param2, event->param3);
+        break;
+    case DEF_OFFSET:
+        if (!part) break;
+        set_vector(&part->def_offset, event->param1, event->param2, event->param3);
+        break;
+    case DEF_VECTOR1:
+        if (!part) break;
+        set_vector(&part->def_Squash, event->param1, event->param2, event->param3);
+        break;
+    case DEF_VECTOR2:
+        if (!part) break;
+        set_vector(&part->def_RelCentre, event->param1, event->param2, event->param3);
+        break;
+    case DEF_COLOUR:
+        if (!part) break;
+        part->default_color = (uint8_t)event->param1;
+        break;
+    case DEF_FLAGS:
+        if (!part) break;
+        part->default_flags = (uint16_t)event->param1;
+        break;
+    case DEF_POSITION:
+        if (!part) break;
+        set_vector(&part->def_position, event->param1, event->param2, event->param3);
+        break;
+    case INTERACT:
+        if (pickup_trace_on()) {
+            fprintf(stderr, "[PICK] INTERACT sub=%d ev_idx=%d p2=%d actor=%d act=%d "
+                            "-> part=%d '%s' | hands:",
+                    event->param1, event->event_index, event->param2,
+                    actor->name_index, action ? action->action_index : -1,
+                    part ? part->name_index : -1,
+                    part ? file_find_part_name_str(part->name_index) : "-");
+            for (part_t *hp = actor->actor_parts_list; hp; hp = hp->next_in_display_list)
+                if (hp->actor_2_held)
+                    fprintf(stderr, " part%d='%s'", hp->name_index,
+                            file_find_thing_name(hp->actor_2_held->name_index));
+            fprintf(stderr, "\n");
+            fflush(stderr);
+        }
+        switch (event->param1) {
+        case 0: /* CheckPartHit */
+            WTRACE("EVT CheckPartHit actor=%d part=%p p2=%d p3=%d\n",
+                   actor->name_index, (void *)part, event->param2, event->param3);
+            if (part) check_part_hit(part, event->param2);
+            break;
+        case 1: /* CheckPickUp */
+            if (part) check_pick_up(part, event->param2);
+            break;
+        case 2: /* CheckPutDown */
+            if (part) check_put_down(part, action ? (action->action_flags & 2) : 0);
+            break;
+        case 3: /* HoldThingWithPart */ {
+            if (!part) break;
+            actor_t *a = thing_tab[event->param2];
+            PTRACE("[PICK] HoldThingWithPart part=%d '%s' actor=%d thing=%d '%s' "
+                   "prev_held=%d\n",
+                   part->name_index, file_find_part_name_str(part->name_index),
+                   part->parent_actor->name_index, (int)event->param2,
+                   a ? file_find_thing_name(a->name_index) : "-",
+                   part->actor_2_held ? part->actor_2_held->name_index : -1);
+            if (a) {
+                /* 0x425A64: whatever this part was already holding is released
+                 * properly first, otherwise the old thing keeps a live
+                 * part_heap_link and stays glued to the hand. */
+                if (game_version == GAME_VERSION_E1 &&
+                    part->actor_2_held && part->actor_2_held != a) {
+                    part_t *p = part;
+                    while (p->holding_actor) {
+                        ((part_t *)p->holding_actor)->next_in_path = p;
+                        p = (part_t *)p->holding_actor;
+                    }
+                    part->next_in_path = NULL;
+                    find_positions_on_path(part->parent_actor);
+                    hold_thing_with_part(part->actor_2_held, part);
+                    part->actor_2_held->part_heap_link = NULL;
+                }
+                if (a->part_heap_link) {
+                    ((part_t *)a->part_heap_link)->actor_2_held = NULL;
+                }
+                part->actor_2_held = a;
+                a->part_heap_link = part;
+            }
+            if (game_version == GAME_VERSION_E1 && selected_thing == part->parent_actor)
+                update_game_icons();
+            break;
+        }
+        case 4: /* ExecutePartCode */
+            if (event->param2 && code_tab[event->param2 - 1]) {
+                if (part)
+                    execute_part_code(part, (int16_t)(event->param2 - 1));
+                else
+                    execute_code(code_tab[event->param2 - 1], NULL);
+            }
+            break;
+        case 5:
+            /* asm move_modify_part_424FEC+BB0: no gender test. Male and female
+             * lines sit on parts only one hero model has, so the part lookup
+             * above already picks the right one. */
+            if (sound_fx_on && sound_is_on) {
+                play_sound_ecstatica(actor, event->param2, action ? (action->action_flags & 2) : 0, 0);
+            }
+            break;
+        case 6: /* FireBullet (E2) */
+            if (part) fire_bullet(part);
+            break;
+        case 7: /* BloodSpurt (E2) */
+            if (part) blood_spurt(part);
+            break;
+        case 8: /* SpawnActor (E2) */
+            if (part) spawn_actor(part, event->param2, event->param3, 0, 1);
+            break;
+        case 9: /* SpawnActor2 (E2) */
+            if (part) spawn_actor(part, event->param2, event->param3, 1, 1);
+            break;
+        default:
+            break;
+        }
+        return; /* INTERACT returns directly, like reference */
+    case ADD_PART: {
+        if (!part) break;
+        int16_t part_id = event->param1;
+        if (part->parent_actor && part->parent_actor->_PartTab &&
+            !part->parent_actor->_PartTab->field_0[part_id]) {
+            part_t *p = add_part((actor_t *)part);
+            if (p) {
+                p->name_index = part_id;
+                p->parent_actor->_PartTab->field_0[part_id] = p;
+            }
+        }
+        break;
+    }
+    case CUT_PART:
+        if (part) remove_part(part);
+        break;
+    case ANCHOR_PART:
+        if (part) anchor_part(part, part->parent_actor);
+        break;
+    case LOOSEN_JOINT:
+        if (part) loosen_joint(part);
+        break;
+    case UNLOOSEN_JOINT:
+        if (part) unloosen_joint(part);
+        break;
+    case TWO_PART_LIMB:
+        if (part) make_2_part_limb(part);
+        break;
+    case UNMAKE_LIMB:
+        if (part) unmake_2_part_limb(part);
+        break;
+    case ADD_POINT: {
+        if (!part) break;
+        point_t *new_pt = add_point(part);
+        if (new_pt) {
+            new_pt->point_index = event->param1;
+            if (part->parent_actor && part->parent_actor->_PointTab)
+                part->parent_actor->_PointTab->field_0[new_pt->point_index] = new_pt;
+        }
+        break;
+    }
+    case ADD_TRIANGLE: {
+        if (event->param1 >= 0 && event->param2 >= 0 && event->param3 >= 0 &&
+            actor->_PointTab) {
+            point_t *pts[4];
+            pts[0] = actor->_PointTab->field_0[event->param1];
+            pts[1] = actor->_PointTab->field_0[event->param2];
+            pts[2] = actor->_PointTab->field_0[event->param3];
+            pts[3] = NULL;
+            if (pts[0] && pts[1] && pts[2]) {
+                tri_t *t = add_triangle(actor, pts);
+                if (t) {
+                    t->tri_index = event->event_index;
+                    if (actor->_TriangleTab)
+                        actor->_TriangleTab->field_0[event->event_index] = t;
+                }
+            }
+        }
+        break;
+    }
+    case MAKE_QUAD:
+        if (triangle && !triangle->quad_point4 && triangle->parent_actor &&
+            triangle->parent_actor->_PointTab &&
+            triangle->parent_actor->_PointTab->field_0[event->param1]) {
+            triangle->quad_point4 = triangle->parent_actor->_PointTab->field_0[event->param1];
+        }
+        break;
+    case POINT_TO_POINT:
+        if (!part) break;
+        if (event->param1 < 0) {
+            part->point_to_point = NULL;
+        } else if (part->parent_actor && part->parent_actor->_PointTab) {
+            part->point_to_point = part->parent_actor->_PointTab->field_0[event->param1];
+        }
+        break;
+    case TRI_SHADE_NAME:
+        if (triangle)
+            triangle->tri_shade_name = event->param1;
+        break;
+    case TRI_TEX_NAME:
+        if (triangle)
+            triangle->texture_name_index = event->param1;
+        break;
+    case TRI_TEXTURE1:
+        if (triangle) {
+            triangle->u1 = event->param1;
+            triangle->v1 = event->param2;
+            triangle->u2 = event->param3;
+        }
+        break;
+    case TRI_TEXTURE2:
+        if (triangle) {
+            triangle->v2 = event->param1;
+            triangle->u3 = event->param2;
+            triangle->v3 = event->param3;
+        }
+        break;
+    case TRI_TEXTURE3:
+        if (triangle) {
+            triangle->u4 = event->param1;
+            triangle->v4 = event->param2;
+        }
+        break;
+    case PART_TEXTURE:
+        /* Textures not used in the shipped game */
+        break;
+    default:
+        break;
+    }
+}
+
+/* move_make_part_absolute  E1: 0x426C24 | E2: 0x42D6A0 */
+void make_part_absolute(part_t *part) {
+    if (part->flags & 0x200)
+        return;
+
+    actor_t *actor = part->parent_actor;
+    make_identity(&actor->matrix_1);
+    if (actor->Rotate.Y)
+        rotate_about_y(&actor->matrix_1, (uint16_t)actor->Rotate.Y);
+    if (actor->Rotate.X)
+        rotate_about_x(&actor->matrix_1, (uint16_t)actor->Rotate.X);
+    if (actor->Rotate.Z)
+        rotate_about_z(&actor->matrix_1, (uint16_t)actor->Rotate.Z);
+    find_position_of_extremity(part);
+    find_relative_rotations(part, &actor->matrix_1);
+    copy_vector(&part->AbsPosition, &part->joint_position);
+    part->flags |= 0x200;
+}
+
+/* move_make_part_base_relative  E1: 0x426CB8 | E2: 0x42D734 */
+void make_part_base_relative(part_t *part) {
+    if (part->flags & 0x200)
+        return;
+
+    actor_t *actor = part->parent_actor;
+    find_position_of_extremity(part);
+
+    vector_t input;
+    for (int i = 0; i < 3; i++)
+        input.data[i] = part->joint_position.data[i] - actor->actor_center.data[i];
+
+    matrix3x3_t inv;
+    matrix_inverse(&actor->matrix33_2, &inv);
+    vector_t output;
+    c_matrix_vector(&output, &inv, &input);
+
+    part->AbsPosition.X = output.X;
+    part->AbsPosition.Y = output.Y;
+    part->AbsPosition.Z = output.Z;
+
+    matrix3x3_t combined;
+    matrix_mult(&inv, &part->matrix_1, &combined);
+    find_relative_rotations(part, &combined);
+    part->flags |= 0x4200;
+}
+
+/* move_make_part_relative  E1: 0x426D58 | E2: 0x42D7D4 */
+void make_part_relative(part_t *part) {
+    if (!(part->flags & 0x200))
+        return;
+
+    actor_t *actor = part->parent_actor;
+    make_identity(&actor->matrix_2);
+    if (actor->rotate_vector.Y)
+        rotate_about_y(&actor->matrix_2, (uint16_t)actor->rotate_vector.Y);
+    if (actor->rotate_vector.X)
+        rotate_about_x(&actor->matrix_2, (uint16_t)actor->rotate_vector.X);
+    if (actor->rotate_vector.Z)
+        rotate_about_z(&actor->matrix_2, (uint16_t)actor->rotate_vector.Z);
+    find_position_of_extremity(part);
+
+    vector_t input;
+    input.X = part->joint_position.X - actor->position_vector.X;
+    input.Y = part->joint_position.Y - actor->position_vector.Y;
+    input.Z = part->joint_position.Z - actor->position_vector.Z;
+
+    matrix3x3_t inv;
+    matrix_inverse(&actor->matrix_2, &inv);
+    vector_t output;
+    c_matrix_vector(&output, &inv, &input);
+    copy_vector(&part->AbsPosition, &output);
+
+    matrix3x3_t combined;
+    matrix_mult(&inv, &part->matrix_1, &combined);
+    find_relative_rotations(part, &combined);
+    part->flags &= 0xBDFF;  /* clear 0x4200 */
+}
+
+/* move_find_footstep_sound_42FC84 — return sound index for hero_material. */
+int find_footstep_sound(void) {
+    switch (hero_material) {
+    case 0: case 5: case 8:                 return 7;
+    case 3: case 23:                        return 8;
+    case 4: case 17:                        return 3;
+    case 7:                                 return 1;
+    case 13:                                return 10;
+    case 16:                                return 2;
+    case 18: case 19: case 21:              return 9;
+    case 24: case 25: case 27: case 29:     return 4;
+    case 28:                                return 5;
+    case 26:                                return 11;
+    default:                                return 0;
+    }
+}
+
+/* move_play_sound_ecstatica  E1: ? | E2P: 0x42FCE0 */
+void play_sound_ecstatica(actor_t *actor, int sound_index, int volume_flags, int direct_volume) {
+    if (!sound_fx_on || !sound_is_on)
+        return;
+
+    int dist_volume = 127;
+
+    if (direct_volume) {
+        dist_volume = direct_volume;
+    } else if (actor && selected_thing && actor != selected_thing) {
+        int16_t direction, distance;
+        find_direction_and_distance(&direction, &distance,
+            actor->position_vector.X - selected_thing->position_vector.X,
+            actor->position_vector.Z - selected_thing->position_vector.Z);
+        if (game_version == GAME_VERSION_E1) {
+            /* asm move_play_sound_427DF4: ground distance only, and the demon
+             * is heard at full volume in its scenes. */
+            if (volume_flags) {
+                if (strcmp(thing_names[actor->name_index].field_0, "demon") == 0)
+                    distance = 0;
+                else
+                    distance -= 1024;
+            }
+        } else {
+            distance += (int16_t)abs(actor->position_vector.Y - selected_thing->position_vector.Y);
+            if (volume_flags)
+                distance -= 1024;
+        }
+        if (distance < 0)
+            distance = 0;
+        dist_volume = (0x2000 - distance) >> 6;
+        if (dist_volume > 127) dist_volume = 127;
+        if (dist_volume < 0) dist_volume = 0;
+    }
+
+    if (dist_volume <= 0)
+        return;
+
+    if (game_version == 2 && actor == selected_thing && sound_index == 0) {
+        sound_index = find_footstep_sound();
+        if (sound_index == 0) return;
+    }
+
+    uint32_t t0 = PROF_CLOCK();
+    check_sound_loaded(sound_index);
+    PROF_OP(PROF_OP_SOUND_LOAD, PROF_CLOCK() - t0);
+    sound_t *sound = sound_tab[sound_index];
+    if (!sound) return;
+
+    if (sound->volume <= 100)
+        dist_volume = sound->volume * dist_volume / 100;
+    else
+        dist_volume = 127;
+
+    uint32_t t1 = PROF_CLOCK();
+    start_playing_sample(sound, volume_flags, dist_volume);
+    PROF_OP(PROF_OP_SOUND_START, PROF_CLOCK() - t1);
+}
+
+/* move_see_if_anything_hit_42EFDC — combat collision for a hitting part. */
+void see_if_anything_hit(part_t *part, int16_t hit_param) {
+    if (!part || !part->parent_actor) return;
+
+    actor_t *hitter_actor = part->parent_actor;
+
+    actor_t *holder = NULL;
+    if (hitter_actor->part_heap_link) {
+        holder = hitter_actor->part_heap_link->parent_actor;
+    }
+
+    DBG_LOG(2, "[HIT] see_if_anything_hit: hitter=%d holder=%d\n",
+            hitter_actor->name_index, holder ? holder->name_index : -1);
+    WTRACE("SIAH hitter=%d holder=%d hitcode=%d jp=(%d,%d,%d)\n",
+           hitter_actor->name_index, holder ? holder->name_index : -1,
+           hitter_actor->actor_hit_code, part->joint_position.X,
+           part->joint_position.Y, part->joint_position.Z);
+#define HREJ(why) do { \
+    if (target == selected_thing) \
+        WTRACE("  SKIP hero: %s\n", why); \
+    } while (0)
+
+    for (actor_t *target = root_thing; target; target = target->next_in_display_list) {
+        if (target == selected_thing && (target->flags & 0x2000)) {
+        }
+        if (target == hitter_actor) { HREJ("self"); continue; }
+        if (target == holder) { HREJ("holder"); continue; }
+        if (target->name_index == hitter_actor->spawner_index) { HREJ("spawner"); continue; }
+
+        if (target->part_heap_link &&
+            target->part_heap_link->parent_actor == hitter_actor) { HREJ("held-by-hitter"); continue; }
+
+        if (!target->actor_reperture || target->actor_reperture->action_slots[34] < 0) {
+            HREJ("no-interact-slot(34)"); continue;
+        }
+
+        int16_t direction, distance;
+        find_direction_and_distance(&direction, &distance,
+            part->joint_position.X - target->position_vector.X,
+            part->joint_position.Z - target->position_vector.Z);
+        if (distance >= target->actor_box_size) {
+            if (target == selected_thing)
+                WTRACE("  SKIP hero: dist %d >= box %d\n", distance, target->actor_box_size);
+            continue;
+        }
+
+        int16_t vert = part->joint_position.Y - target->position_vector.Y;
+        if (vert <= -2560 || vert >= 512) {
+            HREJ("vert out of range"); continue;
+        }
+
+        if (target->actor_behavior == BH_DYING || target->actor_behavior == BH_DEAD) {
+            HREJ("dying/dead"); continue;
+        }
+
+        if (target->flags & 0x2000) {
+            HREJ("flags&0x2000 CannotBeHit"); continue;
+        }
+
+        if (target->actor_scene) {
+            HREJ("in scene"); continue;
+        }
+
+        if (target->actor_act.act_action && (target->actor_act.flags & 0x80)) {
+            HREJ("act.flags&0x80"); continue;
+        }
+
+        /* Scene 8 started, hitter was spawned, target has no WalkLeft and is
+         * not the hero: skip. */
+        if ((scene_name_flags[8] & 2) &&
+            hitter_actor->spawner_index >= 0 &&
+            target->actor_reperture->action_slots[3] < 0 &&
+            target != selected_thing) {
+            continue;
+        }
+        if (target == selected_thing)
+            WTRACE("  HIT hero: hitcode=%d hpcode=%d hp=%d\n",
+                   hitter_actor->actor_hit_code, target->code_at_hp_change,
+                   target->actor_hitpoints);
+
+        target->hit_angle = arctan(
+            target->position_vector.X - hitter_actor->position_vector.X,
+            target->position_vector.Z - hitter_actor->position_vector.Z);
+        target->hit_type = 1;  /* hit_type = Normal */
+
+        /* Play random hit sound (E2 only — E1 uses keyframe events) */
+        if (game_version == 2 && sound_fx_on && sound_is_on) {
+            int snd = ((2 * my_rand()) <= 0x8000) ? 13 : 12;
+            play_sound_ecstatica(hitter_actor, snd, 0, 0);
+        }
+
+        if (game_version == GAME_VERSION_E1) {
+            /* asm move_see_if_anyhing_hit_427A10+1BF: E1 has no effective-hitter
+             * resolution (always part->parent_actor), no strength/weapon/armour
+             * scaling and no difficulty scaling — every hit is a flat 40. */
+            if (hitter_actor->actor_hit_code >= 0) {
+                code_t *code = code_tab[hitter_actor->actor_hit_code];
+                if (code)
+                    execute_code(code, target);
+                else
+                    target->actor_hitpoints -= 40;
+            } else if (hit_param) {
+                code_t *code = (hit_param > 0 && hit_param <= CODE_TAB_SIZE)
+                    ? code_tab[hit_param - 1] : NULL;
+                if (code)
+                    execute_code(code, NULL);
+                else
+                    do_info_req("Can't find code in Hit");
+                continue;
+            } else {
+                target->flags |= 0x2000;
+                target->actor_behavior = BH_GET_HIT;
+                if (target != selected_thing || !no_die)
+                    target->actor_hitpoints -= 40;
+            }
+
+            if (target->code_at_hp_change >= 0) {
+                code_t *code = code_tab[target->code_at_hp_change];
+                if (code)
+                    execute_code(code, target);
+            }
+            if (target == selected_thing)
+                draw_life_bar();
+            continue;
+        }
+
+        /* A held puzzle item (book, cross) with its own hit code fires that
+         * code; otherwise the holder is the hitter. */
+        actor_t *effective_hitter;
+        if (holder && hitter_actor->actor_hit_code >= 0)
+            effective_hitter = hitter_actor;  /* puzzle item: use item's code */
+        else
+            effective_hitter = holder ? holder : hitter_actor;
+
+        if (effective_hitter->actor_hit_code >= 0) {
+            code_t *code = code_tab[effective_hitter->actor_hit_code];
+            if (code) {
+                execute_sub_obj_code(code, target, effective_hitter, target);
+            } else {
+                do_info3_req("Can't find HitCode",
+                    thing_names[effective_hitter->name_index].field_0,
+                    code_names[effective_hitter->actor_hit_code].field_0);
+            }
+        } else {
+            target->actor_behavior = BH_GET_HIT;
+            target->flags |= 0x2000;  /* CannotBeHit */
+
+            int damage = 0;
+
+            if (target == selected_thing) {
+                if (!no_die) {
+                    damage = 5 * effective_hitter->actor_strength_factor / 100;
+                }
+            } else {
+                damage = 40 * effective_hitter->actor_strength_factor / 100;
+
+                actor_t *weapon = NULL;
+                part_t *right_arm = NULL;
+
+                if (holder) {
+                    /* Part belongs to a weapon held by holder */
+                    weapon = part->parent_actor;
+                } else {
+                    /* Part belongs to the fighter directly; check right hand for weapon */
+                    right_arm = hitter_actor->_PartTab ? hitter_actor->_PartTab->field_0[8] : NULL;
+                    if (right_arm) {
+                        weapon = right_arm->actor_2_held;
+                    }
+                }
+
+                if (!weapon) {
+                    if (right_arm) {
+                        /* Hitting with bare hand: halve damage */
+                        damage /= 2;
+                    }
+                } else {
+                    if (weapon->actor_magic) {
+                        damage += 20 * (weapon->actor_magic_factor - 100) / 100;
+                        adjust_magic(weapon, -1);
+                    } else {
+                        damage += 20 * (weapon->actor_strength_factor - 100) / 100;
+                    }
+                }
+            }
+
+            /* Apply damage (difficulty scaling for hero) */
+            if (target == selected_thing) {
+                int scaled;
+                if (difficulty == 0) {
+                    scaled = 50 * damage / armour_factor;
+                } else if (difficulty == 1) {
+                    scaled = 100 * damage / armour_factor;
+                } else {
+                    scaled = 200 * damage / armour_factor;
+                }
+                target->actor_hitpoints -= (int16_t)scaled;
+            } else {
+                target->actor_hitpoints -= (int16_t)damage;
+            }
+        }
+
+        if (target->code_at_hp_change >= 0) {
+            code_t *code = code_tab[target->code_at_hp_change];
+            if (code) {
+                execute_sub_obj_code(code, target, effective_hitter, target);
+            } else {
+                do_info3_req("Can't find GetHitCode",
+                    thing_names[target->name_index].field_0,
+                    code_names[target->code_at_hp_change].field_0);
+            }
+        }
+
+        if (target == selected_thing) {
+            WTRACE("  HERO after: hp=%d bh=%d flags=%04x\n",
+                   target->actor_hitpoints, target->actor_behavior, target->flags);
+            draw_life_bar();
+        }
+    }
+}
+
+/* move_look_for_pick_up_427128 — E1 takes the hand part and answers 4 (the
+ * put-down slot) when the hand is absent or full. The result is a repertoire
+ * slot offset. */
+int look_for_pick_up_e1(part_t *hand) {
+    if (!hand) {
+        PTRACE("[PICK] hand=NULL -> 4\n");
+        return 4;
+    }
+    if (hand->actor_2_held) {
+        PTRACE("[PICK] hand part=%d already holds thing=%d -> 4\n",
+               hand->name_index, hand->actor_2_held->name_index);
+        return 4;
+    }
+    int r = look_for_pick_up(hand->parent_actor);
+    PTRACE("[PICK] hand part=%d -> %d\n", hand->name_index, r);
+    return r;
+}
+
+/* move_look_for_pick_up_42DC9C (E2) / 427128 (E1) — find a pickable item in front of actor */
+int look_for_pick_up(actor_t *actor) {
+    if (!actor) return 3;
+
+    int fwd_x = ((int)actor->actor_box_size * sine_table[(uint16_t)actor->rotate_vector.Y]) >> 14;
+    int fwd_z = ((int)actor->actor_box_size * cosn_table[(uint16_t)actor->rotate_vector.Y]) >> 14;
+    int target_x = actor->position_vector.X + fwd_x;
+    int target_z = actor->position_vector.Z + fwd_z;
+
+    int pre_filter = (game_version == GAME_VERSION_E1)
+        ? 2 * actor->actor_box_size
+        : 7 * actor->actor_box_size / 2;
+
+    int best_dist = 0x7FFF;
+    actor_t *found_thing = NULL;
+    int found_height = 0;
+
+    for (actor_t *t = root_thing; t; t = t->next_in_display_list) {
+        if (!(t->flags & 0x20)) continue;  /* CanBePickedUp */
+        if (t == actor) continue;
+        if (t->part_heap_link) continue;
+        /* E1 works off position_vector only and has no such guard; E2
+         * dereferences actor_parts_list below. */
+        if (game_version != GAME_VERSION_E1 && !t->actor_parts_list) continue;
+
+        int16_t rel_x = t->position_vector.X - target_x;
+        int ax = rel_x <= 0 ? -rel_x : rel_x;
+        if (ax > pre_filter) continue;
+
+        int16_t rel_z = t->position_vector.Z - target_z;
+        int az = rel_z <= 0 ? -rel_z : rel_z;
+        if (az > pre_filter) continue;
+
+        PTRACE("[PICK]   cand thing=%d '%s' flags=%04x parts=%s pos=(%d,%d,%d) "
+               "rel=(%d,%d)\n",
+               t->name_index, file_find_thing_name(t->name_index), t->flags,
+               t->actor_parts_list ? "yes" : "NO",
+               t->position_vector.X, t->position_vector.Y, t->position_vector.Z,
+               rel_x, rel_z);
+
+        int16_t dir, dist;
+        find_direction_and_distance(&dir, &dist, rel_x, rel_z);
+
+        if (game_version == GAME_VERSION_E1) {
+            if (dist <= actor->actor_box_size && dist < best_dist) {
+                found_thing = t;
+                best_dist = dist;
+                found_height = (int)actor->position_vector.Y
+                    - 2 * (int)actor->actor_box_size
+                    - (int)t->position_vector.Y;
+            }
+        } else {
+            int16_t rel_h = actor->position_vector.Y - t->actor_parts_list->joint_position.Y;
+            if (rel_h <= 700 && rel_h >= -200 &&
+                dist <= actor->actor_box_size && dist < best_dist) {
+                found_thing = t;
+                best_dist = dist;
+                found_height = rel_h;
+            }
+        }
+    }
+
+    actor->target_actor = found_thing;
+    PTRACE("[PICK] actor=%d box=%d fwd=(%d,%d) chose thing=%d '%s' dist=%d height=%d\n",
+           actor->name_index, actor->actor_box_size, target_x, target_z,
+           found_thing ? found_thing->name_index : -1,
+           found_thing ? file_find_thing_name(found_thing->name_index) : "-",
+           best_dist, found_height);
+    if (!found_thing)
+        return 3;  /* PickUp_Nothing */
+
+    if (game_version == GAME_VERSION_E1) {
+        /* 0x4272C4: no dead-actor branch here, only 0/1/2. */
+        int bs = actor->actor_box_size;
+        if (found_height < -bs) return 0;
+        if (found_height <= bs) return 1;
+        return 2;
+    }
+
+    if (found_thing->flags & 4) {  /* Dead */
+        if (found_height < 100)  return 5;
+        if (found_height <= 400) return 6;
+        return 7;
+    }
+    if (found_height < 100)  return 0;
+    if (found_height <= 400) return 1;
+    return 2;
+}
+
+/* move_look_for_a_fight_42E684 — find nearest enemy in range */
+actor_t *look_for_a_fight(actor_t *actor) {
+    if (!actor) return NULL;
+
+    int best_angle_diff = 0x10000000;
+    actor_t *best = NULL;
+
+    for (actor_t *t = root_thing; t; t = t->next_in_display_list) {
+        if (thing_name_flags[t->name_index] & 4) continue;  /* Dead */
+        if (!(t->flags & 0x1000)) continue;                 /* not fightable */
+        if (t == actor) continue;
+
+        int dx = t->position_vector.X - actor->position_vector.X;
+        int dz = t->position_vector.Z - actor->position_vector.Z;
+        int adx = dx <= 0 ? -dx : dx;
+        int adz = dz <= 0 ? -dz : dz;
+        if (adx >= 1024 || adz >= 1024) continue;
+
+        uint16_t dir = arctan((int16_t)dx, (int16_t)dz);
+        int dist;
+        if (!dx && !dz) {
+            dist = 0;
+        } else if (adz <= adx) {
+            int s = sine_table[dir];
+            if (!s) { dist = 0; } else { dist = (dx << 14) / s; }
+        } else {
+            int c = cosn_table[dir];
+            if (!c) { dist = 0; } else { dist = (dz << 14) / c; }
+        }
+        if (dist < 0) dist = -dist;
+        if (dist >= 4096) continue;
+
+        int angle_diff = (int16_t)(actor->rotate_vector.Y - dir);
+        if (angle_diff < 0) angle_diff = -angle_diff;
+        if (angle_diff < best_angle_diff) {
+            best_angle_diff = angle_diff;
+            best = t;
+        }
+    }
+    return best;
+}
+
+/* move_find_best_target_up_down_42E7DC — returns 1 (target above), -1 (below), 0 (same level) */
+int find_best_target_up_down(actor_t *actor) {
+    if (!actor) return 0;
+
+    int best_score = 0x10000000;
+    actor_t *best = NULL;
+
+    for (actor_t *t = root_thing; t; t = t->next_in_display_list) {
+        if (!t->actor_reperture) continue;
+        if (thing_name_flags[t->name_index] & 4) continue;  /* Dead */
+        if (t->actor_reperture->action_slots[34] < 0) continue;  /* no Interact action */
+        if (t == actor) continue;
+
+        /* Check if target is a "good" fight target (not 0x200, has KillDown) */
+        int is_good = 0;
+        if (t->actor_reperture && !(t->flags & 0x0200) &&
+            t->actor_reperture->action_slots[9] >= 0)
+            is_good = 1;
+
+        int dx = t->position_vector.X - actor->position_vector.X;
+        int dz = t->position_vector.Z - actor->position_vector.Z;
+        int adx = dx <= 0 ? -dx : dx;
+        int adz = dz <= 0 ? -dz : dz;
+        if (adx >= 1280 || adz >= 1280) continue;
+
+        uint16_t dir = arctan((int16_t)dx, (int16_t)dz);
+        int dist;
+        if (!dx && !dz) {
+            dist = 0;
+        } else if (adz <= adx) {
+            int s = sine_table[dir];
+            if (!s) { dist = 0; } else { dist = (dx << 14) / s; }
+        } else {
+            int c = cosn_table[dir];
+            if (!c) { dist = 0; } else { dist = (dz << 14) / c; }
+        }
+        if (dist < 0) dist = -dist;
+
+        int dy = t->position_vector.Y - actor->position_vector.Y;
+        int ady = dy <= 0 ? -dy : dy;
+        if (dist + ady >= 1280) continue;
+
+        int16_t angle_diff = (int16_t)(dir - actor->rotate_vector.Y);
+        if (angle_diff < 0) angle_diff = -angle_diff;
+        if (angle_diff >= 0x6000) continue;
+
+        int effective = angle_diff;
+        if (!is_good)
+            effective += 0x8000;  /* lower priority */
+        if (effective < best_score) {
+            best_score = effective;
+            best = t;
+        }
+    }
+
+    if (!best) return 0;
+
+    part_t *target_head = best->_PartTab ? best->_PartTab->field_0[2] : NULL;
+    if (!target_head) target_head = best->actor_parts_list;
+    part_t *self_head = actor->_PartTab ? actor->_PartTab->field_0[2] : NULL;
+    if (!self_head) return 0;
+    if (!target_head) return 0;
+
+    int height_diff = self_head->joint_position.Y - target_head->joint_position.Y;
+    if (height_diff > 300)  return 1;   /* target above */
+    if (height_diff < -300) return -1;  /* target below */
+    return 0;
+}
+
+/* move_interpolate_pos_42ED6C — interpolate facing angle toward best target */
+void interpolate_pos(actor_t *actor, int game_time, int range) {
+    if (!actor) return;
+
+    int best_score = 0x10000000;
+    actor_t *best = NULL;
+    int16_t best_dir = 0;
+    int16_t best_angle_diff = 0;
+
+    for (actor_t *t = root_thing; t; t = t->next_in_display_list) {
+        if (!t->actor_reperture) continue;
+        if (thing_name_flags[t->name_index] & 4) continue;  /* Dead */
+        if (t->actor_reperture->action_slots[34] < 0) continue;  /* no Interact */
+        if (t == actor) continue;
+
+        int is_good = 0;
+        if (t->actor_reperture && !(t->flags & 0x0200) &&
+            t->actor_reperture->action_slots[9] >= 0)
+            is_good = 1;
+
+        int dx = t->position_vector.X - actor->position_vector.X;
+        int dz = t->position_vector.Z - actor->position_vector.Z;
+        int adx = dx <= 0 ? -dx : dx;
+        int adz = dz <= 0 ? -dz : dz;
+        if (adx >= range || adz >= range) continue;
+
+        uint16_t dir = arctan((int16_t)dx, (int16_t)dz);
+        int dist;
+        if (!dx && !dz) {
+            dist = 0;
+        } else if (adz <= adx) {
+            int s = sine_table[dir];
+            if (!s) { dist = 0; } else { dist = (dx << 14) / s; }
+        } else {
+            int c = cosn_table[dir];
+            if (!c) { dist = 0; } else { dist = (dz << 14) / c; }
+        }
+        if (dist < 0) dist = -dist;
+
+        int dy = t->position_vector.Y - actor->position_vector.Y;
+        int ady = dy <= 0 ? -dy : dy;
+        int total = dist + ady;
+        if (total >= range) continue;
+
+        /* Must be Visible or within 0x500 */
+        if (!(t->flags & 8) && total >= 0x500) continue;
+
+        int16_t angle_diff = (int16_t)(dir - actor->rotate_vector.Y);
+        int16_t abs_angle = angle_diff <= 0 ? -angle_diff : angle_diff;
+        if (abs_angle >= 0x6000) continue;
+
+        int effective = abs_angle;
+        if (!is_good)
+            effective += 0x8000;
+        if (effective < best_score) {
+            best_score = effective;
+            best = t;
+            best_dir = (int16_t)dir;
+            best_angle_diff = (int16_t)(dir - actor->rotate_vector.Y);
+        }
+    }
+
+    if (!best) return;
+
+    action_t *act = actor->actor_act.act_action;
+    if (!act) return;
+
+    int pos;
+    if (act->act_duration != 0)
+        pos = (game_time << 16) / act->act_duration;
+    else
+        pos = 0x10000;
+
+    uint16_t remains = 0xFFFF - actor->actor_act.key_progress;
+    if (actor->actor_act.key_progress != 0xFFFF && pos <= remains) {
+        actor->rotate_vector.Y += (int16_t)(((pos << 14) / remains * best_angle_diff) >> 14);
+    } else {
+        actor->rotate_vector.Y = best_dir;
+    }
+}
+
+/* move_find_2_part_rot_z  E1: ? | E2P: 0x42D3F4 */
+void find_2_part_rot_z(part_t *part) {
+    part_t *second = (part_t *)part->actor_parts_list;
+    if (!second) {
+        beep_error("2 part limb has no 2nd part");
+        return;
+    }
+    part_t *extremity = (part_t *)second->actor_parts_list;
+    if (!extremity) {
+        beep_error("2 part limb has no extremity");
+        return;
+    }
+
+    part_t *p = extremity;
+    while (p->holding_actor) {
+        ((part_t *)p->holding_actor)->next_in_path = p;
+        p = (part_t *)p->holding_actor;
+    }
+    extremity->next_in_path = NULL;
+
+    find_positions_on_path(extremity->parent_actor);
+
+    matrix3x3_t matr_int;
+    if (part->flags & 0x10) {  /* Loosen */
+        matr_int = part->matr_d;
+    } else {
+        matr_int = part->parent_actor->matrix_1;
+    }
+
+    vector_t input;
+    input.X = extremity->joint_position.X - part->joint_position.X;
+    input.Y = extremity->joint_position.Y - part->joint_position.Y;
+    input.Z = extremity->joint_position.Z - part->joint_position.Z;
+
+    matrix3x3_t inv;
+    matrix_inverse(&matr_int, &inv);
+    vector_t output;
+    c_matrix_vector(&output, &inv, &input);
+
+    int16_t ry = arctan(output.X, output.Z);
+    if (ry)
+        rotate_vector_about_y(&output, -ry);
+    int16_t rx = arctan(-output.Y, output.Z);
+    if (rx)
+        rotate_vector_about_x(&output, -rx);
+    if (ry)
+        rotate_about_y(&matr_int, ry);
+    if (rx)
+        rotate_about_x(&matr_int, rx);
+
+    int16_t twist = 0;
+    if (part->flags & 0x80) {  /* FollowExtremity */
+        input.X = extremity->matrix_1._13 - extremity->matrix_1._12;
+        input.Y = extremity->matrix_1._23 - extremity->matrix_1._22;
+        input.Z = extremity->matrix_1._33 - extremity->matrix_1._32;
+        matrix_inverse(&matr_int, &inv);
+        c_matrix_vector(&output, &inv, &input);
+        twist = arctan(output.X, -output.Y);
+    }
+
+    input.X = part->matrix_1._13;
+    input.Y = part->matrix_1._23;
+    input.Z = part->matrix_1._33;
+    matrix_inverse(&matr_int, &inv);
+    c_matrix_vector(&output, &inv, &input);
+
+    part->Rotate.Z = arctan(output.X, -output.Y) - twist;
+}
+
+/* move_make_2_part_limb  E1: ? | E2P: 0x42D554 */
+void make_2_part_limb(part_t *part) {
+    part_t *second = (part_t *)part->actor_parts_list;
+    if (!second) {
+        beep_error("2 part limb has no 2nd part");
+        return;
+    }
+    part_t *extremity = (part_t *)second->actor_parts_list;
+    if (!extremity) {
+        beep_error("2 part limb has no extremity");
+        return;
+    }
+
+    find_2_part_rot_z(part);
+
+    actor_t *actor = part->parent_actor;
+
+    vector_t input;
+    input.X = extremity->joint_position.X - actor->position_vector.X;
+    input.Y = extremity->joint_position.Y - actor->position_vector.Y;
+    input.Z = extremity->joint_position.Z - actor->position_vector.Z;
+
+    matrix3x3_t inv;
+    matrix_inverse(&actor->matrix_1, &inv);
+    vector_t output;
+    c_matrix_vector(&output, &inv, &input);
+
+    extremity->AbsPosition.X = output.X;
+    extremity->AbsPosition.Y = output.Y;
+    extremity->AbsPosition.Z = output.Z;
+
+    matrix3x3_t combined;
+    matrix_mult(&inv, &extremity->matrix_1, &combined);
+    find_relative_rotations(extremity, &combined);
+
+    part->flags |= 0x20;  /* TwoPartsLimb */
+}
+
+/* move_unmake_2_part_limb  E1: ? | E2P: 0x42D61C */
+void unmake_2_part_limb(part_t *part) {
+    if (!(part->flags & 0x20))
+        return;
+
+    part_t *second = (part_t *)part->actor_parts_list;
+    if (!second) {
+        beep_error("2 part limb has no 2nd part");
+        return;
+    }
+    part_t *extremity = (part_t *)second->actor_parts_list;
+    if (!extremity) {
+        beep_error("2 part limb has no extremity");
+        return;
+    }
+
+    part_t *p = extremity;
+    while (p->holding_actor) {
+        ((part_t *)p->holding_actor)->next_in_path = p;
+        p = (part_t *)p->holding_actor;
+    }
+    extremity->next_in_path = NULL;
+
+    find_positions_on_path(extremity->parent_actor);
+
+    matrix3x3_t inv, combined;
+
+    matrix_inverse(&((part_t *)part->holding_actor)->matrix_1, &inv);
+    matrix_mult(&inv, &part->matrix_1, &combined);
+    find_relative_rotations(part, &combined);
+
+    matrix_inverse(&part->matrix_1, &inv);
+    matrix_mult(&inv, &second->matrix_1, &combined);
+    find_relative_rotations(second, &combined);
+
+    matrix_inverse(&second->matrix_1, &inv);
+    matrix_mult(&inv, &extremity->matrix_1, &combined);
+    find_relative_rotations(extremity, &combined);
+
+    part->flags &= ~0x20;  /* clear TwoPartsLimb */
+}
+
+/* move_blood_spurt_42F85C */
+void blood_spurt(part_t *part) {
+    if (!part || !part->parent_actor) return;
+
+    /* Chain 1: owner held_by_part. */
+    actor_t *owner_actor = part->parent_actor;
+    part_t *held_by_part = owner_actor->part_heap_link;
+    if (held_by_part) {
+        part_t *cursor = held_by_part;
+        if (cursor->holding_actor) {
+            do {
+                part_t *nxt = (part_t *)cursor->holding_actor;
+                nxt->next_in_path = cursor;
+                cursor = nxt;
+            } while (cursor->holding_actor);
+        }
+        held_by_part->next_in_path = NULL;
+        if (held_by_part->parent_actor)
+            find_positions_on_path(held_by_part->parent_actor);
+    }
+    /* Chain 2: from part itself. */
+    for (part_t *i = part; i->holding_actor; i = (part_t *)i->holding_actor)
+        ((part_t *)i->holding_actor)->next_in_path = i;
+    part->next_in_path = NULL;
+    find_positions_on_path(part->parent_actor);
+
+    vector_t input = { .X = 0, .Y = 0, .Z = 0x4000 };
+    vector_t direction;
+    matrix3x3_t m1 = part->matrix_1;
+    matrix_vector(&input, &direction, &m1);
+    int16_t r1 = (int16_t)my_rand();
+    rotate_vector_about_x(&direction, (int16_t)(((2 * r1) - 0x7FFF) >> 8));
+    int16_t r2 = (int16_t)my_rand();
+    rotate_vector_about_y(&direction, (int16_t)(((2 * r2) - 0x7FFF) >> 8));
+    int16_t r3 = (int16_t)my_rand();
+    rotate_vector_about_z(&direction, (int16_t)(((2 * r3) - 0x7FFF) >> 8));
+
+    check_actor_loaded_by_index(5);
+    check_action_loaded(1);
+    if (thing_tab[5] && action_tab[1]) {
+        copy_vector(&thing_tab[5]->position_vector, &part->ellipse_center);
+        find_relative_rot_vector(&thing_tab[5]->rotate_vector, &part->matrix_1);
+        add_to_display_list(thing_tab[5]);
+        thing_tab[5]->actor_act.act_action = NULL;
+        force_action(thing_tab[5], action_tab[1], 1);
+    }
+}
+
+/* move_fire_bullet_42F8C4 */
+void fire_bullet(part_t *part) {
+    if (!part || !part->parent_actor) return;
+    int hit_found = 0;
+
+    /* Chain 1: owner held_by_part. */
+    actor_t *owner_actor = part->parent_actor;
+    part_t *held_by_part = owner_actor->part_heap_link;
+    if (held_by_part) {
+        part_t *cursor = held_by_part;
+        if (cursor->holding_actor) {
+            do {
+                part_t *nxt = (part_t *)cursor->holding_actor;
+                nxt->next_in_path = cursor;
+                cursor = nxt;
+            } while (cursor->holding_actor);
+        }
+        held_by_part->next_in_path = NULL;
+        if (held_by_part->parent_actor) {
+            find_positions_on_path(held_by_part->parent_actor);
+            held_by_part->parent_actor->hold_timer = 120;
+        }
+    }
+    /* Chain 2: from part itself. */
+    for (part_t *i = part; i->holding_actor; i = (part_t *)i->holding_actor)
+        ((part_t *)i->holding_actor)->next_in_path = i;
+    part->next_in_path = NULL;
+    find_positions_on_path(part->parent_actor);
+
+    vector_t input = { .X = 0, .Y = 0, .Z = 0x4000 };
+    vector_t direction;
+    matrix3x3_t m1 = part->matrix_1;
+    matrix_vector(&input, &direction, &m1);
+    int16_t r1 = (int16_t)my_rand();
+    rotate_vector_about_x(&direction, (int16_t)(((2 * r1) - 0x7FFF) >> 8));
+    int16_t r2 = (int16_t)my_rand();
+    rotate_vector_about_y(&direction, (int16_t)(((2 * r2) - 0x7FFF) >> 8));
+    int16_t r3 = (int16_t)my_rand();
+    rotate_vector_about_z(&direction, (int16_t)(((2 * r3) - 0x7FFF) >> 8));
+
+    int16_t hit_angle_val = arctan(direction.X, direction.Z);
+    vector_t pos;
+    copy_vector(&pos, &part->ellipse_center);
+
+    direction.X = (int16_t)(((int32_t)direction.X << 7) >> 14);
+    direction.Y = (int16_t)(((int32_t)direction.Y << 7) >> 14);
+    direction.Z = (int16_t)(((int32_t)direction.Z << 7) >> 14);
+
+    for (int step = 0; step < 20; ++step) {
+        vector_t prev = pos;
+        pos.X += direction.X;
+        pos.Y += direction.Y;
+        pos.Z += direction.Z;
+
+        for (actor_t *target = root_thing; target; target = target->next_in_display_list) {
+            if (target == part->parent_actor) continue;
+
+            int hittable = 0;
+            rephead_t *rep = target->actor_reperture;
+            if (rep && rep->action_slots[34 /* Interact */] >= 0) hittable = 1;
+
+            if (hittable) {
+                part_t *held = part->parent_actor->part_heap_link;
+                if (held && target == held->parent_actor) hittable = 0;
+            }
+
+            int b = target->actor_behavior;
+            if (b == BH_DYING || b == BH_DEAD
+                || (target->flags & 0x2000)  /* CannotBeHit */
+                || target->actor_scene)
+                hittable = 0;
+
+            if (b == BH_EXTERNAL) hittable = 1;
+
+            if (!hittable) continue;
+
+            int16_t dir, dist;
+            find_direction_and_distance(&dir, &dist,
+                (int16_t)(pos.X - target->position_vector.X),
+                (int16_t)(pos.Z - target->position_vector.Z));
+            if (dist >= 192) continue;
+
+            target->hit_angle = hit_angle_val;
+            target->hit_type = 2;           /* HitType::Range */
+            if (target->actor_behavior != BH_EXTERNAL) {
+                target->actor_behavior = BH_GET_HIT;
+                target->flags |= 0x2000;     /* CannotBeHit */
+                if (target == selected_thing && no_die) {
+                    target->actor_hitpoints -= 10;
+                } else {
+                    target->actor_hitpoints -= 110;
+                }
+            }
+            hit_found = 1;
+            break;
+        }
+        if (hit_found) break;
+
+        if (find_height_now_vis(&pos) < pos.Y) {
+            pos = prev;
+            direction.X >>= 3; direction.Y >>= 3; direction.Z >>= 3;
+            for (int sub_step = 0; sub_step < 8; ++sub_step) {
+                pos.X += direction.X; pos.Y += direction.Y; pos.Z += direction.Z;
+                if (find_height_now_vis(&pos) < pos.Y) break;
+            }
+            check_actor_loaded_by_index(4);
+            check_action_loaded(0);
+            if (thing_tab[4] && action_tab[0]) {
+                copy_vector(&thing_tab[4]->position_vector, &pos);
+                int16_t r4 = (int16_t)my_rand();
+                thing_tab[4]->rotate_vector.Z = 0;
+                thing_tab[4]->rotate_vector.Y = (int16_t)(2 * r4);
+                thing_tab[4]->rotate_vector.X = 0;
+                add_to_display_list(thing_tab[4]);
+                thing_tab[4]->actor_act.act_action = NULL;
+                force_action(thing_tab[4], action_tab[0], 1);
+            }
+            return;
+        }
+    }
+}
+
+/* move_check_part_hit  E1: 0x427CE0 | E2: 0x42FA6C */
+void check_part_hit(part_t *part, int16_t hit_param) {
+    if (part->flags & 0x20) {
+        /* TwoPartsLimb: walk 3-part chain */
+        part_t *second = (part_t *)part->actor_parts_list;
+        part_t *extremity = second ? (part_t *)second->actor_parts_list : NULL;
+        if (!extremity) {
+            goto single_part;
+        }
+
+        part_t *p = extremity;
+        while (p->holding_actor) {
+            ((part_t *)p->holding_actor)->next_in_path = p;
+            p = (part_t *)p->holding_actor;
+        }
+        extremity->next_in_path = NULL;
+
+        find_positions_on_path(extremity->parent_actor);
+        see_if_anything_hit(part, hit_param);
+        see_if_anything_hit(second, hit_param);
+        see_if_anything_hit(extremity, hit_param);
+    } else {
+    single_part:
+        ;
+        part_t *p = part;
+        while (p->holding_actor) {
+            ((part_t *)p->holding_actor)->next_in_path = p;
+            p = (part_t *)p->holding_actor;
+        }
+        part->next_in_path = NULL;
+
+        find_positions_on_path(part->parent_actor);
+        see_if_anything_hit(part, hit_param);
+    }
+
+    if (part->actor_2_held) {
+        find_positions((actor_t *)part->actor_2_held, 0);
+        part_t *hp = (part_t *)part->actor_2_held->actor_parts_list;
+        for (; hp; hp = hp->next_in_display_list)
+            see_if_anything_hit(hp, hit_param);
+    }
+}
+
+/* move_check_pick_up  E1: 0x427308 | E2: 0x42DE2C */
+void check_pick_up(part_t *part, int16_t param) {
+    part_t *p = part;
+    while (p->holding_actor) {
+        ((part_t *)p->holding_actor)->next_in_path = p;
+        p = (part_t *)p->holding_actor;
+    }
+    part->next_in_path = NULL;
+
+    find_positions_on_path(part->parent_actor);
+
+    actor_t *target = part->parent_actor->target_actor;
+    PTRACE("[PICK] CheckPickUp part=%d '%s' actor=%d param=%d target=%d '%s' "
+           "already_held=%d\n",
+           part->name_index, file_find_part_name_str(part->name_index),
+           part->parent_actor->name_index, (int)param,
+           target ? target->name_index : -1,
+           target ? file_find_thing_name(target->name_index) : "-",
+           part->actor_2_held ? part->actor_2_held->name_index : -1);
+    if (!target) return;
+
+    int16_t dir, dist;
+    find_direction_and_distance(&dir, &dist,
+        part->joint_position.X - target->position_vector.X,
+        part->joint_position.Z - target->position_vector.Z);
+
+    int16_t dy = part->joint_position.Y - target->position_vector.Y;
+    if (dy < 0) dy = -dy;
+    if (dist > dy) dy = dist;
+
+    if (part->actor_2_held) {
+        hold_thing_with_part(part->actor_2_held, part);
+        if (game_version == GAME_VERSION_E1) {
+            part->actor_2_held->part_heap_link = NULL;
+        } else {
+            int16_t ground = find_height_now(&part->actor_2_held->position_vector, NULL);
+            int16_t target_y = ground - 30;
+            int16_t delta = target_y - part->actor_2_held->position_vector.Y;
+            if (delta < 0) delta = -delta;
+            if (delta >= 64) {
+                copy_vector(&part->actor_2_held->position_vector, &part->parent_actor->position_vector);
+                part->actor_2_held->position_vector.Y -= 30;
+            } else {
+                part->actor_2_held->position_vector.Y = target_y;
+            }
+            part->actor_2_held->rotate_vector.Z = 0;
+            part->actor_2_held->rotate_vector.X = 0;
+            part->actor_2_held->part_heap_link = NULL;
+        }
+    }
+
+    part->actor_2_held = target;
+    target->part_heap_link = part;
+
+    if (game_version == GAME_VERSION_E1) {
+        /* 0x4273E6 indexes dword_4EBCBC, which is code_tab_4EBCC0 - 4, so the
+         * slot is param-1; the same event's error path names code param-1 too.
+         * The code runs with no actor and no part (execute_code at 0x443D1C
+         * zeroes both). */
+        int16_t code_idx = (int16_t)(param - 1);
+        if (param && code_idx >= 0 && code_idx < CODE_TAB_SIZE && code_tab[code_idx])
+            execute_code(code_tab[code_idx], NULL);
+    } else {
+        int16_t code_id = target->picked_up_code;
+        if (code_id >= 0 && code_id < CODE_TAB_SIZE && code_tab[code_id])
+            execute_sub_obj_code(code_tab[code_id], target, part->parent_actor, target);
+    }
+
+    if (selected_thing == part->parent_actor) {
+        int16_t f = part->parent_actor->action_state;
+        if (f == 0)      part->parent_actor->action_state = 3;
+        else if (f == 1) part->parent_actor->action_state = 4;
+        else if (f == 2) part->parent_actor->action_state = 5;
+        else             DBG_LOG(1, "[PICKUP] WARN: action_state=%d (not 0/1/2) no transition (actor=%d)\n",
+                                 (int)f, target ? target->name_index : -1);
+        update_game_icons();
+    }
+}
+
+/* move_check_put_down  E1: 0x42706C | E2: 0x42DAE8 */
+void check_put_down(part_t *part, int flags) {
+    actor_t *held = part->actor_2_held;
+    PTRACE("[PICK] CheckPutDown part=%d '%s' actor=%d flags=%d held=%d '%s'\n",
+           part->name_index, file_find_part_name_str(part->name_index),
+           part->parent_actor->name_index, flags,
+           held ? held->name_index : -1,
+           held ? file_find_thing_name(held->name_index) : "-");
+    if (!held) return;
+
+    part_t *p = part;
+    while (p->holding_actor) {
+        ((part_t *)p->holding_actor)->next_in_path = p;
+        p = (part_t *)p->holding_actor;
+    }
+    part->next_in_path = NULL;
+
+    find_positions_on_path(part->parent_actor);
+    hold_thing_with_part(part->actor_2_held, part);
+
+    if (game_version != GAME_VERSION_E1 && !flags) {
+        int16_t ground = find_height_now(&held->position_vector, NULL);
+        int16_t target_y = ground - 30;
+        int16_t delta = target_y - held->position_vector.Y;
+        if (delta < 0) delta = -delta;
+        if (delta >= 64) {
+            copy_vector(&held->position_vector, &part->parent_actor->position_vector);
+            held->position_vector.Y -= 30;
+        } else {
+            held->position_vector.Y = target_y;
+        }
+        held->rotate_vector.Z = 0;
+        held->rotate_vector.X = 0;
+    }
+
+    part->actor_2_held->part_heap_link = NULL;
+    part->actor_2_held = NULL;
+
+    if (selected_thing == part->parent_actor) {
+        int16_t f = part->parent_actor->action_state;
+        if (f == 3)      part->parent_actor->action_state = 0;
+        else if (f == 4) part->parent_actor->action_state = 1;
+        else if (f == 5) part->parent_actor->action_state = 2;
+        update_game_icons();
+    }
+}
+
+/* move_add_act_to_act_list  E1: ? | E2: 0x42CF80 */
+void add_act_to_act_list(act_t *act, actor_t *actor) {
+    act_t *head = actor->actor_act_list;
+    if (!head) {
+        actor->actor_act_list = act;
+        act->next = NULL;
+        return;
+    }
+    act_t *tail = head;
+    while (tail->next)
+        tail = tail->next;
+    tail->next = act;
+    act->next = NULL;
+}
+
+/* move_init_act_heap  E1: ? | E2: 0x42D028 */
+void init_act_heap(void) {
+    for (int i = 0; i < ACT_SIZE; i++)
+        act_arr[i].flags = 0;
+}
+
+/* move_anchor_part  E1: ? | E2: 0x42D048
+ * Moves the actor so the part that was anchored stays where it was pinned,
+ * then pins `part` where it is now. The root part means "no anchor". */
+void anchor_part(part_t *part, actor_t *actor) {
+    if (part == actor->anchored_part) return;
+
+    part_t *old = actor->anchored_part;
+    if (old && old != actor->actor_parts_list) {
+        make_path(old);
+        find_positions_on_path(actor);
+        for (int i = 0; i < 3; i++)
+            actor->position_vector.data[i] +=
+                actor->anchor_position.data[i] - old->ellipse_center.data[i];
+    }
+    if (part != actor->actor_parts_list) {
+        make_path(part);
+        find_positions_on_path(actor);
+        copy_vector(&actor->anchor_position, &part->ellipse_center);
+    }
+    actor->anchored_part = part;
+}
+
+/* move_loosen_joint  E1: ? | E2: 0x42D118 */
+void loosen_joint(part_t *part) {
+    if (part->flags & 0x10) return;
+
+    make_path(part);
+    find_rotations_on_path(part->parent_actor);
+    part_t *parent = (part_t *)part->holding_actor;
+    find_inverse_of_attitude(parent, &part->inverse_attitude);
+    copy_matrix(&part->matr_d, &parent->matrix_1);
+    part->flags |= 0x10;
+}
+
+/* move_unloosen_joint  E1: ? | E2: 0x42D180 */
+void unloosen_joint(part_t *part) {
+    if (!(part->flags & 0x10)) return;
+
+    matrix3x3_t inverse, combined;
+    find_inverse_of_attitude((part_t *)part->holding_actor, &inverse);
+    matrix_mult(&combined, &inverse, &part->matrix_1);
+    find_relative_rotations(part, &combined);
+    part->flags &= ~0x10;
+}
+
+/* move_find_inverse_of_attitude  E1: ? | E2: 0x42D1C4
+ * Climbs from `part` towards the root (holding_actor is a part's parent),
+ * undoing each rotation, until a loosened joint supplies its stored inverse.
+ * With none on the way, the actor's own rotation is undone instead. */
+void find_inverse_of_attitude(part_t *part, matrix3x3_t *output) {
+    make_identity(output);
+
+    for (part_t *p = part; p->holding_actor; p = (part_t *)p->holding_actor) {
+        if (p->Rotate.Z) rotate_about_z(output, -p->Rotate.Z);
+        if (p->Rotate.X) rotate_about_x(output, -p->Rotate.X);
+        if (p->Rotate.Y) rotate_about_y(output, -p->Rotate.Y);
+
+        if (p->flags & 0x10) {
+            matrix3x3_t temp;
+            matrix_mult(&temp, output, &p->inverse_attitude);
+            *output = temp;
+            return;
+        }
+    }
+
+    actor_t *actor = part->parent_actor;
+    if (actor->rotate_vector.Z) rotate_about_z(output, -actor->rotate_vector.Z);
+    if (actor->rotate_vector.X) rotate_about_x(output, -actor->rotate_vector.X);
+    if (actor->rotate_vector.Y) rotate_about_y(output, -actor->rotate_vector.Y);
+}
+
+/* move_make_path  E1: ? | E2: 0x42D2BC
+ * Points each ancestor's next_in_path at the child below it, so a walk from
+ * the actor ends at `part`. */
+void make_path(part_t *part) {
+    for (part_t *p = part; p->holding_actor; p = (part_t *)p->holding_actor)
+        p->holding_actor->next_in_path = p;
+    part->next_in_path = NULL;
+}
+
+/* move_fix_part / move_unfix_part  E1: ? | E2: 0x42D8B8 */
+void fix_part(void) {
+}
+
+void unfix_part(void) {
+}
+
+/* move_reorient_thing  E1: ? | E2: 0x42DAE0 */
+void reorient_thing(actor_t *actor) {
+    actor->state_flags |= 0x20;
+}
+
+/* move_likely_target_up_or_down  E1: ? | E2: 0x42E04C */
+void likely_target_up_or_down(actor_t *actor, int *out_dir, int *out_updown) {
+    int best_dir = 0;
+    int best_updown = 0;
+
+    part_t *hero_part = NULL;
+    if (selected_thing)
+        hero_part = selected_thing->_PartTab->field_0[2];
+
+    if (!hero_part) {
+        *out_dir = 0;
+        *out_updown = 0;
+        return;
+    }
+
+    int best_score = 0x7FFFFFFF;
+    actor_t *best_actor = NULL;
+
+    /* Pass 1: non-scenery actors */
+    actor_t *thing = root_thing;
+    while (thing) {
+        if (!(thing_name_flags[thing->name_index] & 4)) {
+            part_t *tpart = thing->_PartTab ? thing->_PartTab->field_0[2] : NULL;
+            int valid = 0;
+            if (tpart && thing != selected_thing && (thing->flags & 0x1000))
+                valid = 1;
+            if (valid) {
+                int16_t dx = (int16_t)(thing->position_vector.X >> 16) -
+                             (int16_t)(selected_thing->position_vector.X >> 16);
+                int16_t dz = (int16_t)(thing->position_vector.Z >> 16) -
+                             (int16_t)(selected_thing->position_vector.Z >> 16);
+
+                int16_t tgt_y = (int16_t)(tpart->ellipse_center.Y >> 16);
+                int16_t hero_y = (int16_t)(hero_part->ellipse_center.Y >> 16);
+                int y_diff = -(tgt_y - hero_y);
+                int abs_y_diff = y_diff < 0 ? -y_diff : y_diff;
+
+                int16_t direction, distance;
+                find_dirn_and_dist(&direction, &distance, dx, dz);
+                if (abs_y_diff > distance)
+                    distance = (int16_t)abs_y_diff;
+
+                int16_t rel_angle = selected_thing->rotate_vector.Y - direction;
+                int abs_angle = rel_angle > 0 ? rel_angle : -rel_angle;
+                int score;
+                if (abs_angle >= 0x4000)
+                    score = 0x7FFFFFFF;
+                else
+                    score = (int)abs_angle * distance;
+
+                if (score < best_score) {
+                    best_score = score;
+                    best_actor = thing;
+                    best_dir = distance / 3;
+                    int abs_y_comp = abs_y_diff;
+                    if (best_dir < abs_y_comp) {
+                        if (abs_y_comp / 2 > best_dir) {
+                            best_dir = y_diff < 0 ? 3 : 1;
+                        } else {
+                            best_dir = y_diff < 0 ? 2 : best_dir;
+                            if (y_diff >= 0) best_dir = 1;
+                        }
+                    } else {
+                        best_dir ^= best_dir;
+                    }
+
+                    if (y_diff > 0)       best_updown = 1;
+                    else if (y_diff > -20) best_updown = 2;
+                    else if (y_diff > -40) best_updown = 3;
+                    else if (y_diff > -60) best_updown = 4;
+                    else                   best_updown = 5;
+                }
+            }
+        }
+        thing = (actor_t *)thing->next_in_display_list;
+    }
+
+    if (best_actor) {
+        *out_dir = best_dir;
+        *out_updown = best_updown;
+        return;
+    }
+
+    /* Pass 2: scenery actors */
+    thing = root_thing;
+    while (thing) {
+        if (thing_name_flags[thing->name_index] & 4) {
+            part_t *tpart = thing->_PartTab ? thing->_PartTab->field_0[2] : NULL;
+            int valid = 0;
+            if (tpart && thing != selected_thing && (thing->flags & 0x1000))
+                valid = 1;
+            if (valid) {
+                int16_t dx = (int16_t)(selected_thing->position_vector.X >> 16) -
+                             (int16_t)(thing->position_vector.X >> 16);
+                int16_t dz = (int16_t)(thing->position_vector.Z >> 16) -
+                             (int16_t)(selected_thing->position_vector.Z >> 16);
+
+                int16_t tgt_y = (int16_t)(tpart->ellipse_center.Y >> 16);
+                int16_t hero_y = (int16_t)(hero_part->ellipse_center.Y >> 16);
+                int y_diff = -(tgt_y - hero_y);
+                int abs_y_diff = y_diff < 0 ? -y_diff : y_diff;
+
+                int16_t direction, distance;
+                find_dirn_and_dist(&direction, &distance, dx, dz);
+                if (abs_y_diff > distance)
+                    distance = (int16_t)abs_y_diff;
+
+                int16_t rel_angle = selected_thing->rotate_vector.Y - direction;
+                int abs_angle = rel_angle;
+                if (abs_angle < 0) abs_angle = -abs_angle;
+                int score;
+                if (abs_angle >= 0x4000)
+                    score = 0x7FFFFFFF;
+                else
+                    score = (int)abs_angle * distance;
+
+                if (score < best_score) {
+                    best_score = score;
+                    best_dir = distance / 3;
+                    int abs_y_comp = abs_y_diff;
+                    if (best_dir < abs_y_comp) {
+                        if (abs_y_comp / 2 > best_dir) {
+                            best_dir = y_diff < 0 ? 3 : 1;
+                        } else {
+                            best_dir = y_diff < 0 ? 2 : best_dir;
+                            if (y_diff >= 0) best_dir = 1;
+                        }
+                    } else {
+                        best_dir ^= best_dir;
+                    }
+
+                    if (y_diff > 0)       best_updown = 1;
+                    else if (y_diff > -20) best_updown = 2;
+                    else if (y_diff > -40) best_updown = 3;
+                    else if (y_diff > -60) best_updown = 4;
+                    else                   best_updown = 5;
+                }
+            }
+        }
+        thing = (actor_t *)thing->next_in_display_list;
+    }
+
+    *out_dir = best_dir;
+    *out_updown = best_updown;
+}
+
+/* move_check_fight_rep  E1: ? | E2: 0x42E49C */
+void check_fight_rep(actor_t *actor) {
+    actor->actor_rep_index = 7;
+
+    actor_t *thing = root_thing;
+    while (thing) {
+        if (!(thing_name_flags[thing->name_index] & 4) &&
+            (thing->flags & 0x1000) &&
+            thing != actor)
+        {
+            int16_t dx = (int16_t)(thing->position_vector.X >> 16) -
+                         (int16_t)(actor->position_vector.X >> 16);
+            int abs_dx = dx > 0 ? dx : -dx;
+            if (abs_dx >= 0x400)
+                goto next;
+
+            int16_t dz = (int16_t)(thing->position_vector.Z >> 16) -
+                         (int16_t)(actor->position_vector.Z >> 16);
+            int abs_dz = dz > 0 ? dz : -dz;
+            if (abs_dz >= 0x400)
+                goto next;
+
+            uint16_t angle = arctan(dx, dz);
+            int distance;
+            if (!dx && !dz) {
+                distance = 0;
+            } else if (abs_dz > abs_dx) {
+                int s = sine_table[angle];
+                distance = s ? ((int)dz << 14) / s : 0;
+            } else {
+                int c = cosn_table[angle];
+                distance = c ? ((int)dx << 14) / c : 0;
+            }
+            if (distance < 0) distance = -distance;
+            if (distance >= 0x400)
+                goto next;
+
+            int16_t rel_angle = actor->rotate_vector.Y - (int16_t)angle;
+            int abs_rel = rel_angle > 0 ? (int)rel_angle : -(int)rel_angle;
+            if (abs_rel >= 0x4000)
+                goto next;
+
+            actor->actor_rep_index = 5;
+        }
+next:
+        thing = (actor_t *)thing->next_in_display_list;
+    }
+}

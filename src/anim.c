@@ -1,0 +1,136 @@
+/**
+ * anim.c
+ *
+ * Animation helpers: keyframe ellipses, choice box, action directory.
+ */
+
+#include "anim.h"
+#include "edit.h"
+#include "display.h"
+#include "game.h"
+#include "init.h"
+#include "move.h"
+#include "asm_f.h"
+#include <stdlib.h>
+#include <string.h>
+
+/* anim_add_ellipse_to_key_430568 */
+void add_ellipse_to_key(ellipse_t *new_ellipse, key_state_t *key) {
+    new_ellipse->next = NULL;
+    ellipse_t *ellipse = key->ellipses_list;
+
+    if (ellipse) {
+        while (ellipse->next)
+            ellipse = ellipse->next;
+        ellipse->next = new_ellipse;
+    } else {
+        key->ellipses_list = new_ellipse;
+    }
+}
+
+/* anim_add_ellipse_43059C */
+ellipse_t *add_ellipse(void) {
+    /* Zeroed: ADD_ELLIPSE_EVT fills only some fields, and the rest arrive with
+     * ADD_ELLIPSE_TO_KEY_EVT, which may never come. */
+    ellipse_t *new_ellipse = (ellipse_t *)calloc(1, sizeof(ellipse_t));
+    if (!new_ellipse) {
+        beep_message("Out of memory!");
+        return NULL;
+    }
+    return new_ellipse;
+}
+
+/* anim_calculate_ellipses_one_key_430474 — E2: 0x430474 */
+void calculate_ellipses_one_key(key_state_t *key, actor_t *actor) {
+    ellipse_t *ell = key->ellipses_list;
+    part_t *part = actor->actor_parts_list;
+    while (part) {
+        if (ell) {
+            part->vector_persp.X = ell->field_0;
+            part->vector_persp.Y = ell->field_2;
+            part->mask_distanse_ = ell->field_4;
+            part->projected_axes.X = ell->field_6;
+            part->projected_axes.Y = ell->field_8;
+            part->projected_axes.Z = ell->field_A;
+            part->color = (int8_t)ell->field_C;
+            part->vector_persp.Z = part->mask_distanse_;
+            ell = ell->next;
+        }
+        part = part->next_in_display_list;
+    }
+}
+
+/* anim_calculate_ellipses_430304 — E2: 0x430304 */
+void calculate_ellipses(key_state_t *key, actor_t *actor, int16_t factor) {
+    ellipse_t *cur = key->ellipses_list;
+    ellipse_t *nxt = key->next ? key->next->ellipses_list : NULL;
+    part_t *part = actor->actor_parts_list;
+    while (part) {
+        if (!cur || !nxt)
+            break;
+        part->vector_persp.X = cur->field_0;
+        part->vector_persp.Y = cur->field_2;
+        part->mask_distanse_ = cur->field_4;
+        part->projected_axes.X = cur->field_6;
+        part->projected_axes.Y = cur->field_8;
+        part->projected_axes.Z = cur->field_A;
+        part->color = (int8_t)cur->field_C;
+
+        part->vector_persp.X += (int16_t)(((int)(nxt->field_0 - cur->field_0) * factor) >> 14);
+        part->vector_persp.Y += (int16_t)(((int)(nxt->field_2 - cur->field_2) * factor) >> 14);
+        part->mask_distanse_ += (int16_t)(((int)(nxt->field_4 - cur->field_4) * factor) >> 14);
+        part->projected_axes.X += (int16_t)(((int)(nxt->field_6 - cur->field_6) * factor) >> 14);
+        part->projected_axes.Y += (int16_t)(((int)(nxt->field_8 - cur->field_8) * factor) >> 14);
+        part->projected_axes.Z += (int16_t)(((int)(nxt->field_A - cur->field_A) * factor) >> 14);
+
+        part->vector_persp.Z = part->mask_distanse_;
+
+        cur = cur->next;
+        nxt = nxt->next;
+        part = part->next_in_display_list;
+    }
+}
+
+/* anim_position_external_act_42FE58 — E2: 0x42FE58 */
+void position_external_act(act_t *act, uint16_t game_time, actor_t *actor) {
+    if (game_time < act->key_progress)
+        return;
+
+    key_state_t *cur_key = act->actor_keys_list;
+    if (cur_key) {
+        while (game_time >= cur_key->KEY_position) {
+            event_t *event = cur_key->key_event_list;
+            while (event) {
+                modify_part(event, actor, 0, act->act_action);
+                event = event->next;
+            }
+            if (cur_key == act->actor_keys_list) {
+                if (!(act->act_action->action_flags & 2))
+                    default_modifieds(actor);
+            }
+            act->key_progress = cur_key->KEY_position;
+            cur_key = cur_key->next;
+            if (!cur_key) break;
+        }
+    }
+
+    if (cur_key) {
+        uint16_t prev_pos = act->key_progress;
+        uint16_t next_pos = cur_key->KEY_position;
+        if (next_pos != prev_pos) {
+            int factor = ((int)(game_time - prev_pos) << 14) / (int)(next_pos - prev_pos);
+            if (factor != 0) {
+                event_t *event = cur_key->key_event_list;
+                while (event) {
+                    advance_part(event, (int16_t)factor, actor, act->act_action);
+                    event = event->next;
+                }
+                if (!(act->act_action->action_flags & 2))
+                    advance_def_modifieds(actor, factor);
+            }
+        }
+    }
+
+    act->actor_keys_list = cur_key;
+    act->key_progress = game_time;
+}

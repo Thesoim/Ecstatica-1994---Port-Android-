@@ -1,0 +1,625 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+    # Every push to main rebuilds all targets and refreshes the rolling
+    # "edge" pre-release below, so main always has an installable build of
+    # whatever hasn't been tagged yet.
+    branches:
+      - main
+  # Manual run, for shaking out the build jobs without cutting a release.
+  # Artifacts are still uploaded; the release step only publishes on a tag.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # Single source of truth for the version string every build job stamps
+  # into its artifact filename, and that the release step later uses to
+  # find those same files. A tag push uses the tag itself; a push to main
+  # uses the same vX.Y.Z-edge scheme as the rolling pre-release below;
+  # anything else (workflow_dispatch) falls back to the commit sha, since
+  # those runs never publish a release.
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.compute.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute version
+        id: compute
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            version="${GITHUB_REF#refs/tags/}"
+          else
+            latest=$(git tag -l 'v*' | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } | sort -V | tail -1)
+            latest=${latest:-v0.0.0}
+            IFS='.' read -r major minor patch <<< "${latest#v}"
+            if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" == "refs/heads/main" ]]; then
+              version="v${major}.${minor}.$((patch + 1))-edge"
+            else
+              version="dev-${GITHUB_SHA::7}"
+            fi
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build-macos:
+    needs: version
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build universal binary
+        run: |
+          cmake -S src -B build -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
+          cmake --build build
+
+      - name: Package
+        run: |
+          cd build/bin
+          zip ecstatica-macos-universal-${{ needs.version.outputs.version }}.zip ecstatica
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-build
+          path: build/bin/ecstatica-macos-universal-${{ needs.version.outputs.version }}.zip
+
+  build-linux-x86_64:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libasound2-dev libgl1-mesa-dev
+
+      - name: Build
+        run: |
+          cmake -S src -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+
+      - name: Package AppImage
+        run: |
+          mkdir -p AppDir/usr/bin AppDir/usr/share/applications AppDir/usr/share/icons/hicolor/256x256/apps
+
+          cp build/bin/ecstatica AppDir/usr/bin/
+
+          cat > AppDir/usr/share/applications/ecstatica.desktop << 'DESKTOP'
+          [Desktop Entry]
+          Name=Ecstatica
+          Exec=ecstatica
+          Icon=ecstatica
+          Type=Application
+          Categories=Game;
+          DESKTOP
+
+          cp AppDir/usr/share/applications/ecstatica.desktop AppDir/
+
+          printf '\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\x0f\x00\x00\x01\x01\x00\x05\x18\xd8N\x00\x00\x00\x00IEND\xaeB`\x82' > AppDir/usr/share/icons/hicolor/256x256/apps/ecstatica.png
+          ln -sf usr/share/icons/hicolor/256x256/apps/ecstatica.png AppDir/ecstatica.png
+
+          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool-x86_64.AppImage
+
+          cat > AppDir/AppRun << 'APPRUN'
+          #!/bin/bash
+          SELF=$(readlink -f "$0")
+          HERE=${SELF%/*}
+          exec "${HERE}/usr/bin/ecstatica" "$@"
+          APPRUN
+          chmod +x AppDir/AppRun
+
+          ./appimagetool-x86_64.AppImage --appimage-extract-and-run AppDir ecstatica-linux-x86_64-${{ needs.version.outputs.version }}.AppImage
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64-build
+          path: ecstatica-linux-x86_64-${{ needs.version.outputs.version }}.AppImage
+
+  build-linux-arm64:
+    needs: version
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libasound2-dev libgl1-mesa-dev
+
+      - name: Build
+        run: |
+          cmake -S src -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+
+      - name: Package AppImage
+        run: |
+          mkdir -p AppDir/usr/bin AppDir/usr/share/applications AppDir/usr/share/icons/hicolor/256x256/apps
+
+          cp build/bin/ecstatica AppDir/usr/bin/
+
+          cat > AppDir/usr/share/applications/ecstatica.desktop << 'DESKTOP'
+          [Desktop Entry]
+          Name=Ecstatica
+          Exec=ecstatica
+          Icon=ecstatica
+          Type=Application
+          Categories=Game;
+          DESKTOP
+
+          cp AppDir/usr/share/applications/ecstatica.desktop AppDir/
+
+          printf '\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\x0f\x00\x00\x01\x01\x00\x05\x18\xd8N\x00\x00\x00\x00IEND\xaeB`\x82' > AppDir/usr/share/icons/hicolor/256x256/apps/ecstatica.png
+          ln -sf usr/share/icons/hicolor/256x256/apps/ecstatica.png AppDir/ecstatica.png
+
+          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-aarch64.AppImage
+          chmod +x appimagetool-aarch64.AppImage
+
+          cat > AppDir/AppRun << 'APPRUN'
+          #!/bin/bash
+          SELF=$(readlink -f "$0")
+          HERE=${SELF%/*}
+          exec "${HERE}/usr/bin/ecstatica" "$@"
+          APPRUN
+          chmod +x AppDir/AppRun
+
+          ./appimagetool-aarch64.AppImage --appimage-extract-and-run AppDir ecstatica-linux-arm64-${{ needs.version.outputs.version }}.AppImage
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm64-build
+          path: ecstatica-linux-arm64-${{ needs.version.outputs.version }}.AppImage
+
+  build-windows-x86_64:
+    needs: version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        shell: cmd
+        run: |
+          cmake -S src -B build -DCMAKE_BUILD_TYPE=Release -A x64
+          cmake --build build --config Release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path build/bin -Recurse -Filter ecstatica.exe | Select-Object -First 1
+          Compress-Archive -Path $exe.FullName -DestinationPath ecstatica-windows-x86_64-${{ needs.version.outputs.version }}.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64-build
+          path: ecstatica-windows-x86_64-${{ needs.version.outputs.version }}.zip
+
+  build-windows-arm64:
+    needs: version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        shell: cmd
+        run: |
+          cmake -S src -B build -DCMAKE_BUILD_TYPE=Release -A ARM64
+          cmake --build build --config Release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path build/bin -Recurse -Filter ecstatica.exe | Select-Object -First 1
+          Compress-Archive -Path $exe.FullName -DestinationPath ecstatica-windows-arm64-${{ needs.version.outputs.version }}.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-arm64-build
+          path: ecstatica-windows-arm64-${{ needs.version.outputs.version }}.zip
+
+  build-dos:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Open Watcom
+        uses: open-watcom/setup-watcom@v1
+        with:
+          version: "2.0-64"
+          target: dos
+
+      - name: Build
+        run: make dos
+
+      - name: Package
+        run: |
+          mkdir -p dist/ecstatica-dos
+          cp platforms/dos/ecstatic.exe dist/ecstatica-dos/ECSTATIC.EXE
+          # DOS/4GW is the extender this binary is linked against; without it
+          # the executable cannot start. Open Watcom ships it for exactly this
+          # purpose.
+          cp "$WATCOM/binw/dos4gw.exe" dist/ecstatica-dos/DOS4GW.EXE
+          cat > dist/ecstatica-dos/README.TXT << 'EOF'
+          Ecstatica — DOS build
+
+          Copy ECSTATIC.EXE and DOS4GW.EXE into the game data directory (the one
+          holding CODE\ECSTATIC.FAN) and run ECSTATIC.EXE.
+
+          Requires a 386 or better, ~8 MB of free extended memory, and VESA 2.0
+          with a linear framebuffer for the 640x480 mode. Ecstatica 1's DOS data
+          runs in plain VGA and needs no VESA.
+
+          Sound Blaster output is located from the BLASTER environment variable;
+          without it the game runs silent. MIDI music is not implemented.
+          EOF
+          cd dist && zip -r ../ecstatica-dos-${{ needs.version.outputs.version }}.zip ecstatica-dos
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dos-build
+          path: ecstatica-dos-${{ needs.version.outputs.version }}.zip
+
+  build-win9x:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Open Watcom
+        uses: open-watcom/setup-watcom@v1
+        with:
+          version: "2.0-64"
+          target: nt
+
+      - name: Build
+        run: make win9x
+
+      - name: Package
+        run: |
+          mkdir -p dist/ecstatica-win9x
+          cp platforms/win9x/ecstatica.exe dist/ecstatica-win9x/
+          cat > dist/ecstatica-win9x/README.TXT << 'EOF'
+          Ecstatica — Win9x build
+
+          A 32-bit executable for Windows 95 and later. Copy ecstatica.exe into
+          the game data directory (the one holding CODE\ECSTATIC.FAN) and run it.
+
+          Built with Open Watcom against the Win32 API only, so it also runs on
+          modern Windows and under Wine. Gamepads use the winmm joystick API.
+          EOF
+          cd dist && zip -r ../ecstatica-win9x-${{ needs.version.outputs.version }}.zip ecstatica-win9x
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: win9x-build
+          path: ecstatica-win9x-${{ needs.version.outputs.version }}.zip
+
+  # The SDK images are the upstream toolchains. The jobs run them with
+  # `docker run` rather than as job containers: pspdev/pspdev is Alpine, and
+  # JavaScript actions such as checkout do not run inside musl containers.
+  build-psp:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src pspdev/pspdev:latest \
+            sh -c 'command -v make >/dev/null || apk add --no-cache make; make -j"$(nproc)" -C platforms/psp'
+
+      - name: Package
+        run: |
+          mkdir -p dist/PSP/GAME/ECSTATICA
+          cp platforms/psp/EBOOT.PBP dist/PSP/GAME/ECSTATICA/
+          cat > dist/README.TXT << 'EOF'
+          Ecstatica — PSP build (Ecstatica 1 and 2)
+
+          Copy the PSP folder to the root of the Memory Stick, then copy the game
+          data into PSP/GAME/ECSTATICA beside EBOOT.PBP, so that
+          PSP/GAME/ECSTATICA/CODE/ECSTATIC.FAN exists. The same EBOOT runs either
+          game; it detects which one from the data.
+
+          For Ecstatica 1 copy the DOS release root with its W folder inside it,
+          so the enhanced 640x480 graphics are available.
+
+          Needs custom firmware or a homebrew launcher, or runs in PPSSPP. Sound
+          effects and speech play; music is silent.
+          EOF
+          cd dist && zip -r ../ecstatica-psp-${{ needs.version.outputs.version }}.zip PSP README.TXT
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: psp-build
+          path: ecstatica-psp-${{ needs.version.outputs.version }}.zip
+
+  build-vita:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src vitasdk/vitasdk:latest \
+            sh -c 'make vita VERSION=${{ needs.version.outputs.version }}'
+          # One VPK per game; each is its own LiveArea bubble.
+          cp platforms/vita/build/ecstatica-e1.vpk ecstatica-vita-e1-${{ needs.version.outputs.version }}.vpk
+          cp platforms/vita/build/ecstatica-e2.vpk ecstatica-vita-e2-${{ needs.version.outputs.version }}.vpk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vita-build
+          path: |
+            ecstatica-vita-e1-${{ needs.version.outputs.version }}.vpk
+            ecstatica-vita-e2-${{ needs.version.outputs.version }}.vpk
+
+  # The openfpgaOS SDK artifacts are committed under platforms/pocket/vendor/,
+  # so this builds against exactly the runtime that was tested on hardware.
+  build-pocket:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install RISC-V toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-riscv64-unknown-elf
+          # The ELF links libgcc for rv32imafc/ilp32f; fail here, not at link.
+          test -f "$(riscv64-unknown-elf-gcc -march=rv32imafc -mabi=ilp32f -print-libgcc-file-name)"
+
+      - name: Build
+        run: make -j"$(nproc)" -C platforms/pocket release
+
+      - name: Package
+        run: |
+          mkdir -p dist/tools
+          cp -R platforms/pocket/build/Cores platforms/pocket/build/Platforms platforms/pocket/build/Assets dist/
+          cp platforms/pocket/mkiso.sh dist/tools/
+          cp platforms/pocket/core/instance.e1.json dist/tools/Ecstatica.json
+          cp platforms/pocket/core/instance.e2.json dist/tools/Ecstatica2.json
+          cat > dist/README.TXT << 'EOF'
+          Ecstatica — Analogue Pocket build (openfpgaOS, Ecstatica 1 and 2)
+
+          Copy Cores, Platforms and Assets to the root of the SD card.
+
+          The game data ships as an ISO image, built from your own copy of the
+          game with tools/mkiso.sh:
+
+            ./mkiso.sh <E1 data dir> ecstatica.iso
+            ./mkiso.sh <E2 data dir> ecstatica2.iso
+
+          Put the ISO in Assets/ecstatica/common/, then copy the matching
+          instance file (tools/Ecstatica.json for E1, tools/Ecstatica2.json
+          for E2) to Assets/ecstatica/xesf.Ecstatica/. The game then appears
+          in the Pocket's core menu.
+
+          mkiso.sh needs xorriso, mkisofs, genisoimage or (macOS) hdiutil.
+
+          No MIDI soundfont is included for licensing reasons, so music is
+          silent. Sound effects and speech play. To get music, put your own
+          bank.ofsf in Assets/ecstatica/common/.
+          EOF
+          cd dist && zip -r ../ecstatica-pocket-${{ needs.version.outputs.version }}.zip Cores Platforms Assets tools README.TXT
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pocket-build
+          path: ecstatica-pocket-${{ needs.version.outputs.version }}.zip
+
+  build-web:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 3.1.53
+
+      - name: Build
+        run: make web
+
+      - name: Package
+        run: |
+          cp platforms/web/README.md platforms/web/build/dist/README.md
+          cd platforms/web/build/dist
+          zip -r ../../../../ecstatica-web-${{ needs.version.outputs.version }}.zip .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-build
+          path: ecstatica-web-${{ needs.version.outputs.version }}.zip
+
+  # Plain SDK command-line tools, no Gradle: the runner image ships the SDK
+  # and an NDK. A release key is used when the ANDROID_KEYSTORE_BASE64,
+  # ANDROID_KEYSTORE_PASS and ANDROID_KEY_ALIAS secrets are set; otherwise
+  # build.sh signs with a throwaway debug key.
+  build-android:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build zip
+
+      - name: Build
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASS }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+            export ANDROID_KEYSTORE="$RUNNER_TEMP/release.keystore"
+          fi
+          ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" \
+            platforms/android/build.sh ${{ needs.version.outputs.version }}
+          cp platforms/android/build/ecstatica.apk ecstatica-android-${{ needs.version.outputs.version }}.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-build
+          path: ecstatica-android-${{ needs.version.outputs.version }}.apk
+
+  # Unsigned: sideloading tools sign it with the user's own Apple ID.
+  build-ios:
+    needs: version
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          make ios VERSION=${{ needs.version.outputs.version }}
+          cp platforms/ios/build/ecstatica.ipa ecstatica-ios-${{ needs.version.outputs.version }}.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-build
+          path: ecstatica-ios-${{ needs.version.outputs.version }}.ipa
+
+  release:
+    needs: [version, build-macos, build-linux-x86_64, build-linux-arm64, build-windows-x86_64, build-windows-arm64, build-dos, build-win9x, build-psp, build-vita, build-pocket, build-web, build-android, build-ios]
+    runs-on: ubuntu-latest
+    steps:
+      # Full history and tags: the edge-release steps below need both to
+      # compute the next version and to list commits since the last stable tag.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: &release_files |
+            artifacts/macos-build/ecstatica-macos-universal-${{ needs.version.outputs.version }}.zip
+            artifacts/linux-x86_64-build/ecstatica-linux-x86_64-${{ needs.version.outputs.version }}.AppImage
+            artifacts/linux-arm64-build/ecstatica-linux-arm64-${{ needs.version.outputs.version }}.AppImage
+            artifacts/windows-x86_64-build/ecstatica-windows-x86_64-${{ needs.version.outputs.version }}.zip
+            artifacts/windows-arm64-build/ecstatica-windows-arm64-${{ needs.version.outputs.version }}.zip
+            artifacts/dos-build/ecstatica-dos-${{ needs.version.outputs.version }}.zip
+            artifacts/win9x-build/ecstatica-win9x-${{ needs.version.outputs.version }}.zip
+            artifacts/psp-build/ecstatica-psp-${{ needs.version.outputs.version }}.zip
+            artifacts/vita-build/ecstatica-vita-e1-${{ needs.version.outputs.version }}.vpk
+            artifacts/vita-build/ecstatica-vita-e2-${{ needs.version.outputs.version }}.vpk
+            artifacts/pocket-build/ecstatica-pocket-${{ needs.version.outputs.version }}.zip
+            artifacts/web-build/ecstatica-web-${{ needs.version.outputs.version }}.zip
+            artifacts/android-build/ecstatica-android-${{ needs.version.outputs.version }}.apk
+            artifacts/ios-build/ecstatica-ios-${{ needs.version.outputs.version }}.ipa
+          generate_release_notes: true
+
+      # Rolling pre-release built from every push to main: one tag/release,
+      # force-moved each time, so main always has an installable build of
+      # whatever hasn't been cut into a real version yet. Skipped on manual
+      # workflow_dispatch runs, which are for shaking out the build jobs only.
+      # The version itself comes from the `version` job above, which build
+      # jobs already stamped into their artifact filenames; this step only
+      # needs the notes.
+      - name: Compute edge notes
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          latest=$(git tag -l 'v*' | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } | sort -V | tail -1)
+          latest=${latest:-v0.0.0}
+
+          {
+            echo "Automated development build of \`main\` @ ${GITHUB_SHA::7}, on top of $latest."
+            echo "Moves with every push to main — not a stable release. For the latest tagged version see the [releases page](https://github.com/$GITHUB_REPOSITORY/releases)."
+            echo
+            echo "## Unreleased"
+            echo
+            awk '/^## \[Unreleased\]/{flag=1; next} /^## \[/{flag=0} flag' CHANGELOG.md
+            echo "## Commits since $latest"
+            echo
+            git log --format='- %s (%h)' "$latest"..HEAD
+          } > edge_notes.md
+
+      - name: Move edge tag
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          git tag -f "${{ needs.version.outputs.version }}"
+          git push -f origin "${{ needs.version.outputs.version }}"
+
+      - name: Publish edge pre-release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.version }}
+          name: ${{ needs.version.outputs.version }}
+          prerelease: true
+          body_path: edge_notes.md
+          files: *release_files
+
+      # Only one edge build is ever current: each push to main bumps the
+      # vX.Y.Z-edge version once a release is tagged, which left one stale
+      # pre-release per version behind. Keeps the edge release this run just
+      # published, if any; a tag push keeps none, as the tagged release
+      # supersedes them. Runs after publishing, so a failed publish never
+      # leaves main without an edge build. Tags without a release go too.
+      - name: Prune old edge releases
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT: ${{ needs.version.outputs.version }}
+        run: |
+          gh release list --limit 1000 --json tagName --jq '.[].tagName' |
+            { grep -E -- '-edge$' || true; } |
+            while read -r tag; do
+              [ "$tag" = "$CURRENT" ] && continue
+              echo "Deleting release $tag"
+              gh release delete "$tag" --yes --cleanup-tag
+            done
+          git ls-remote --tags origin |
+            awk '{ print $2 }' | sed -n 's#^refs/tags/\(.*-edge\)$#\1#p' |
+            while read -r tag; do
+              [ "$tag" = "$CURRENT" ] && continue
+              echo "Deleting tag $tag"
+              git push origin ":refs/tags/$tag"
+            done
+
+      # VitaDB's own listing for each of the two games, pointed at this
+      # release's VPK. Tagged releases only: VitaDB copies the VPK to its own
+      # server, so publishing every push to main replaced the stable download
+      # with an untested edge build. Runs after the release step so the VPK
+      # URL exists. One secret per entry (generated on each game's own VitaDB
+      # page); the endpoint is the CI webhook VitaDB homebrew authors use.
+      - name: Publish Ecstatica 1 to VitaDB
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          curl --fail-with-body --show-error \
+            -X POST \
+            -F "secret=${{ secrets.VITADB_SECRET_E1 }}" \
+            -F "vpk_url=https://github.com/${{ github.repository }}/releases/download/${{ needs.version.outputs.version }}/ecstatica-vita-e1-${{ needs.version.outputs.version }}.vpk" \
+            https://www.rinnegatamante.eu/vitadb/publish_nightly.php
+
+      - name: Publish Ecstatica 2 to VitaDB
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          curl --fail-with-body --show-error \
+            -X POST \
+            -F "secret=${{ secrets.VITADB_SECRET_E2 }}" \
+            -F "vpk_url=https://github.com/${{ github.repository }}/releases/download/${{ needs.version.outputs.version }}/ecstatica-vita-e2-${{ needs.version.outputs.version }}.vpk" \
+            https://www.rinnegatamante.eu/vitadb/publish_nightly.php
